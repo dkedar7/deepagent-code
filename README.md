@@ -4,14 +4,13 @@ A universal CLI for running **any** LangGraph agent from the terminal. Framework
 
 ## Why Use This?
 
-| Feature | deepagents-cli | langgraph-utils-cli (this project) |
-|---------|---------------|-----------------------------------|
-| **Framework coupling** | Requires deepagents middleware | Works with ANY LangGraph graph |
-| **Interrupt handling** | Assumes its own middleware format | Handles multiple formats robustly |
-| **Output format** | Uses `.pretty_print()` | Clean JSON-serializable dicts |
-| **Use case** | Running deepagents-created agents | Running arbitrary LangGraph agents |
+`langgraph-utils-cli` provides a **universal CLI for running any LangGraph agent** without requiring any specific framework or middleware. Key benefits:
 
-**This library is better for universal LangGraph agent execution** because it's framework-agnostic and handles diverse graph implementations.
+- **Framework-agnostic**: Works with any LangGraph graph implementation
+- **Flexible interrupt handling**: Automatically handles multiple interrupt formats (tuples, objects, dicts)
+- **Clean streaming output**: JSON-serializable responses with explicit status tracking
+- **Production-ready**: Battle-tested utilities for robust agent execution
+- **Both CLI and Library**: Use from terminal or integrate into your Python code
 
 ## Features
 
@@ -25,13 +24,7 @@ A universal CLI for running **any** LangGraph agent from the terminal. Framework
 
 ## Installation
 
-### From PyPI (when published)
-
-```bash
-pip install langgraph-utils-cli
-```
-
-### From source
+Install from source:
 
 ```bash
 git clone https://github.com/yourusername/langgraph-utils-cli.git
@@ -211,7 +204,7 @@ All utility functions are also exported for advanced use cases:
 ## CLI Options
 
 ```
-Usage: langgraph-cli [OPTIONS] GRAPH_FILE
+Usage: langgraph-cli [OPTIONS] [GRAPH_FILE]
 
 Options:
   -g, --graph-name TEXT      Name of graph variable (default: "graph")
@@ -221,8 +214,71 @@ Options:
                              Handle interrupts interactively (default: True)
   --async-mode / --sync-mode
                              Use async streaming (default: sync)
+  --stream-mode TEXT        Stream mode for LangGraph (default: "updates")
   -v, --verbose             Show verbose output
   --help                    Show this message and exit
+```
+
+## Environment Variables
+
+Compatible with `deepagent-lab` for consistent configuration:
+
+### `DEEPAGENT_AGENT_SPEC`
+
+Specifies agent location using format: `path/to/file.py:variable_name`
+
+```bash
+# Set agent spec
+export DEEPAGENT_AGENT_SPEC="my_agent.py:graph"
+
+# Run without specifying file
+langgraph-cli -m "Hello!"
+```
+
+### `DEEPAGENT_WORKSPACE_ROOT`
+
+Sets the working directory for the agent.
+
+```bash
+# Set workspace
+export DEEPAGENT_WORKSPACE_ROOT="/path/to/workspace"
+
+# Agent will run in this directory
+langgraph-cli my_agent.py -m "Hello!"
+```
+
+### `DEEPAGENT_CONFIG`
+
+Configuration JSON string or path to JSON file.
+
+```bash
+# JSON string
+export DEEPAGENT_CONFIG='{"configurable": {"thread_id": "123"}}'
+
+# Or file path
+export DEEPAGENT_CONFIG="config.json"
+
+langgraph-cli my_agent.py -m "Hello!"
+```
+
+### `DEEPAGENT_STREAM_MODE`
+
+Default stream mode for LangGraph (`updates` or `values`).
+
+```bash
+export DEEPAGENT_STREAM_MODE="values"
+langgraph-cli my_agent.py -m "Hello!"
+```
+
+### Priority
+
+Command-line arguments always override environment variables:
+
+```bash
+export DEEPAGENT_AGENT_SPEC="agent1.py:graph"
+
+# Uses agent2.py instead of agent1.py
+langgraph-cli agent2.py -m "Hello!"
 ```
 
 ## Examples
@@ -314,22 +370,6 @@ Contributions are welcome! Please:
 ## License
 
 MIT License - see LICENSE file for details.
-
-## Comparison with deepagents-cli
-
-While `deepagents-cli` is excellent for the deepagents framework, `langgraph-utils-cli` is designed for universal LangGraph compatibility:
-
-```python
-# deepagents-cli (framework-specific)
-from deepagents.cli import run_agent
-run_agent(agent)  # Expects deepagents middleware
-
-# langgraph-utils-cli (universal)
-from langgraph_utils_cli import stream_graph_updates
-for chunk in stream_graph_updates(any_langgraph_graph, input_data):
-    # Works with ANY LangGraph graph!
-    pass
-```
 
 ## Support
 

@@ -4,11 +4,7 @@ Get up and running with `langgraph-utils-cli` in 5 minutes!
 
 ## Installation
 
-```bash
-pip install langgraph-utils-cli
-```
-
-Or from source:
+Install from source:
 
 ```bash
 git clone https://github.com/yourusername/langgraph-utils-cli.git

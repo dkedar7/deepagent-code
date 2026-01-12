@@ -91,12 +91,13 @@ def serialize_review_config(config: Any) -> Dict[str, Any]:
     Returns:
         Dictionary with allowed_decisions
     """
+    if isinstance(config, dict):
+        allowed_decisions = config.get('allowed_decisions', [])
+    else:
+        allowed_decisions = getattr(config, 'allowed_decisions', [])
+
     return {
-        "allowed_decisions": getattr(
-            config,
-            'allowed_decisions',
-            config.get('allowed_decisions') if isinstance(config, dict) else []
-        )
+        "allowed_decisions": allowed_decisions
     }
 
 
