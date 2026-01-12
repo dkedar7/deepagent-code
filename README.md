@@ -210,7 +210,7 @@ All utility functions are also exported for advanced use cases:
 ## CLI Options
 
 ```
-Usage: langgraph-cli [OPTIONS] GRAPH_FILE
+Usage: langgraph-cli [OPTIONS] [GRAPH_FILE]
 
 Options:
   -g, --graph-name TEXT      Name of graph variable (default: "graph")
@@ -220,8 +220,71 @@ Options:
                              Handle interrupts interactively (default: True)
   --async-mode / --sync-mode
                              Use async streaming (default: sync)
+  --stream-mode TEXT        Stream mode for LangGraph (default: "updates")
   -v, --verbose             Show verbose output
   --help                    Show this message and exit
+```
+
+## Environment Variables
+
+Compatible with `deepagent-lab` for consistent configuration:
+
+### `DEEPAGENT_AGENT_SPEC`
+
+Specifies agent location using format: `path/to/file.py:variable_name`
+
+```bash
+# Set agent spec
+export DEEPAGENT_AGENT_SPEC="my_agent.py:graph"
+
+# Run without specifying file
+langgraph-cli -m "Hello!"
+```
+
+### `DEEPAGENT_WORKSPACE_ROOT`
+
+Sets the working directory for the agent.
+
+```bash
+# Set workspace
+export DEEPAGENT_WORKSPACE_ROOT="/path/to/workspace"
+
+# Agent will run in this directory
+langgraph-cli my_agent.py -m "Hello!"
+```
+
+### `DEEPAGENT_CONFIG`
+
+Configuration JSON string or path to JSON file.
+
+```bash
+# JSON string
+export DEEPAGENT_CONFIG='{"configurable": {"thread_id": "123"}}'
+
+# Or file path
+export DEEPAGENT_CONFIG="config.json"
+
+langgraph-cli my_agent.py -m "Hello!"
+```
+
+### `DEEPAGENT_STREAM_MODE`
+
+Default stream mode for LangGraph (`updates` or `values`).
+
+```bash
+export DEEPAGENT_STREAM_MODE="values"
+langgraph-cli my_agent.py -m "Hello!"
+```
+
+### Priority
+
+Command-line arguments always override environment variables:
+
+```bash
+export DEEPAGENT_AGENT_SPEC="agent1.py:graph"
+
+# Uses agent2.py instead of agent1.py
+langgraph-cli agent2.py -m "Hello!"
 ```
 
 ## Examples

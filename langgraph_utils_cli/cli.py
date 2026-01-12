@@ -4,9 +4,10 @@ CLI for running arbitrary LangGraph agents from the terminal.
 import asyncio
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import click
 from rich.console import Console
@@ -24,6 +25,35 @@ from langgraph_utils_cli.utils import (
 
 
 console = Console()
+
+
+def parse_agent_spec(agent_spec: str) -> Tuple[str, str]:
+    """
+    Parse DEEPAGENT_AGENT_SPEC format: path/to/file.py:variable_name.
+
+    Args:
+        agent_spec: Agent specification string
+
+    Returns:
+        Tuple of (file_path, variable_name)
+
+    Raises:
+        ValueError: If format is invalid
+    """
+    if ':' not in agent_spec:
+        raise ValueError(
+            f"Invalid agent spec format: '{agent_spec}'. "
+            f"Expected format: 'path/to/file.py:variable_name'"
+        )
+
+    parts = agent_spec.rsplit(':', 1)
+    file_path = parts[0]
+    variable_name = parts[1]
+
+    if not file_path.endswith('.py'):
+        raise ValueError(f"Agent spec file must be a .py file: {file_path}")
+
+    return file_path, variable_name
 
 
 def load_graph_from_file(file_path: str, graph_name: str = "graph"):
@@ -216,6 +246,7 @@ async def run_async_graph(
     config: Optional[Dict[str, Any]] = None,
     interactive: bool = True,
     verbose: bool = False,
+    stream_mode: str = "updates",
 ):
     """
     Run an async LangGraph graph.
@@ -226,6 +257,7 @@ async def run_async_graph(
         config: Optional config dict
         interactive: Whether to handle interrupts interactively
         verbose: Whether to show verbose output
+        stream_mode: Stream mode for LangGraph (default: "updates")
     """
     input_data = prepare_agent_input(message=message)
 
@@ -233,7 +265,7 @@ async def run_async_graph(
         has_interrupt = False
         interrupt_data = None
 
-        async for chunk in astream_graph_updates(graph, input_data, config=config):
+        async for chunk in astream_graph_updates(graph, input_data, config=config, stream_mode=stream_mode):
             print_chunk(chunk, verbose=verbose)
 
             if chunk.get("status") == "interrupt":
@@ -255,6 +287,7 @@ def run_sync_graph(
     config: Optional[Dict[str, Any]] = None,
     interactive: bool = True,
     verbose: bool = False,
+    stream_mode: str = "updates",
 ):
     """
     Run a sync LangGraph graph.
@@ -265,6 +298,7 @@ def run_sync_graph(
         config: Optional config dict
         interactive: Whether to handle interrupts interactively
         verbose: Whether to show verbose output
+        stream_mode: Stream mode for LangGraph (default: "updates")
     """
     input_data = prepare_agent_input(message=message)
 
@@ -272,7 +306,7 @@ def run_sync_graph(
         has_interrupt = False
         interrupt_data = None
 
-        for chunk in stream_graph_updates(graph, input_data, config=config):
+        for chunk in stream_graph_updates(graph, input_data, config=config, stream_mode=stream_mode):
             print_chunk(chunk, verbose=verbose)
 
             if chunk.get("status") == "interrupt":
@@ -289,11 +323,10 @@ def run_sync_graph(
 
 
 @click.command()
-@click.argument("graph_file", type=click.Path(exists=True))
+@click.argument("graph_file", type=click.Path(exists=True), required=False)
 @click.option(
     "--graph-name",
     "-g",
-    default="graph",
     help="Name of the graph variable in the file (default: 'graph')",
 )
 @click.option(
@@ -318,29 +351,45 @@ def run_sync_graph(
     help="Use async streaming (default: sync)",
 )
 @click.option(
+    "--stream-mode",
+    help="Stream mode for LangGraph (default: 'updates')",
+)
+@click.option(
     "--verbose",
     "-v",
     is_flag=True,
     help="Show verbose output including node names",
 )
 def main(
-    graph_file: str,
-    graph_name: str,
+    graph_file: Optional[str],
+    graph_name: Optional[str],
     message: Optional[str],
     config: Optional[str],
     interactive: bool,
     use_async: bool,
+    stream_mode: Optional[str],
     verbose: bool,
 ):
     """
     Run a LangGraph agent from the command line.
 
-    GRAPH_FILE is the path to a Python file containing a LangGraph graph.
+    Supports environment variables for configuration (compatible with deepagent-lab):
+
+    - DEEPAGENT_AGENT_SPEC: Agent location (format: path/to/file.py:variable_name)
+    - DEEPAGENT_WORKSPACE_ROOT: Working directory for the agent
+    - DEEPAGENT_CONFIG: Configuration JSON string or path to JSON file
+    - DEEPAGENT_STREAM_MODE: Stream mode for LangGraph (updates or values)
+
+    Command-line arguments override environment variables.
 
     Examples:
 
         # Run with a message
         langgraph-cli my_agent.py -m "Hello, agent!"
+
+        # Use DEEPAGENT_AGENT_SPEC environment variable
+        export DEEPAGENT_AGENT_SPEC="my_agent.py:graph"
+        langgraph-cli -m "Hello!"
 
         # Use a different graph variable name
         langgraph-cli my_agent.py -g my_custom_graph -m "Hello!"
@@ -355,24 +404,71 @@ def main(
         langgraph-cli my_agent.py --no-interactive -m "Hello!"
     """
     try:
-        # Load the graph
-        console.print(f"[cyan]Loading graph from {graph_file}...[/cyan]")
-        graph = load_graph_from_file(graph_file, graph_name)
-        console.print(f"[green]✓ Graph '{graph_name}' loaded successfully[/green]\n")
+        # Get environment variables
+        env_agent_spec = os.getenv('DEEPAGENT_AGENT_SPEC')
+        env_workspace_root = os.getenv('DEEPAGENT_WORKSPACE_ROOT')
+        env_config = os.getenv('DEEPAGENT_CONFIG')
+        env_stream_mode = os.getenv('DEEPAGENT_STREAM_MODE', 'updates')
 
-        # Parse config
+        # Resolve graph file and name
+        final_graph_file = graph_file
+        final_graph_name = graph_name or "graph"
+
+        # If no graph file provided, try DEEPAGENT_AGENT_SPEC
+        if not final_graph_file and env_agent_spec:
+            try:
+                final_graph_file, final_graph_name = parse_agent_spec(env_agent_spec)
+                if verbose:
+                    console.print(f"[dim]Using DEEPAGENT_AGENT_SPEC: {env_agent_spec}[/dim]")
+            except ValueError as e:
+                console.print(f"[red]Error parsing DEEPAGENT_AGENT_SPEC: {e}[/red]")
+                sys.exit(1)
+
+        # Validate we have a graph file
+        if not final_graph_file:
+            console.print("[red]Error: No graph file specified.[/red]")
+            console.print("\nProvide either:")
+            console.print("  1. GRAPH_FILE argument: langgraph-cli my_agent.py")
+            console.print("  2. DEEPAGENT_AGENT_SPEC env var: export DEEPAGENT_AGENT_SPEC='my_agent.py:graph'")
+            sys.exit(1)
+
+        # Change to workspace root if specified
+        if env_workspace_root:
+            workspace_path = Path(env_workspace_root).resolve()
+            if workspace_path.exists():
+                os.chdir(workspace_path)
+                if verbose:
+                    console.print(f"[dim]Changed to workspace: {workspace_path}[/dim]")
+            else:
+                console.print(f"[yellow]Warning: DEEPAGENT_WORKSPACE_ROOT not found: {workspace_path}[/yellow]")
+
+        # Load the graph
+        console.print(f"[cyan]Loading graph from {final_graph_file}...[/cyan]")
+        graph = load_graph_from_file(final_graph_file, final_graph_name)
+        console.print(f"[green]✓ Graph '{final_graph_name}' loaded successfully[/green]\n")
+
+        # Parse config (CLI option overrides environment variable)
         config_dict = None
-        if config:
-            config_path = Path(config)
+        config_source = config or env_config
+
+        if config_source:
+            config_path = Path(config_source)
             if config_path.exists():
                 with open(config_path) as f:
                     config_dict = json.load(f)
+                if verbose:
+                    console.print(f"[dim]Loaded config from file: {config_path}[/dim]")
             else:
                 try:
-                    config_dict = json.loads(config)
+                    config_dict = json.loads(config_source)
+                    if verbose:
+                        console.print(f"[dim]Loaded config from JSON string[/dim]")
                 except json.JSONDecodeError as e:
                     console.print(f"[red]Invalid config JSON: {e}[/red]")
                     sys.exit(1)
+
+        # Get stream mode (CLI option overrides environment variable)
+        final_stream_mode = stream_mode or env_stream_mode
 
         # Get message if not provided
         if not message:
@@ -388,10 +484,10 @@ def main(
 
         if use_async:
             asyncio.run(
-                run_async_graph(graph, message, config_dict, interactive, verbose)
+                run_async_graph(graph, message, config_dict, interactive, verbose, final_stream_mode)
             )
         else:
-            run_sync_graph(graph, message, config_dict, interactive, verbose)
+            run_sync_graph(graph, message, config_dict, interactive, verbose, final_stream_mode)
 
     except FileNotFoundError as e:
         console.print(f"[red]Error: {e}[/red]")
