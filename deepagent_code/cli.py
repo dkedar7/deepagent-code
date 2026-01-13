@@ -286,6 +286,27 @@ def format_result_preview(result: str) -> str:
     return preview
 
 
+def format_duration(seconds: float) -> str:
+    """Format duration in human-readable format."""
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    elif seconds < 60:
+        return f"{seconds:.1f}s"
+    else:
+        minutes = int(seconds // 60)
+        secs = seconds % 60
+        return f"{minutes}m {secs:.1f}s"
+
+
+def print_timing(duration: float, verbose: bool = False):
+    """Print response timing information."""
+    formatted = format_duration(duration)
+    if verbose:
+        print(f"\n{DIM}Response time: {formatted}{RESET}")
+    else:
+        print(f"\n{DIM}{formatted}{RESET}")
+
+
 def print_chunk(chunk: Dict[str, Any], verbose: bool = False):
     """
     Pretty print a chunk from the stream using Claude Code styling.
@@ -469,9 +490,10 @@ async def run_single_turn_async(
     interactive: bool = True,
     verbose: bool = False,
     stream_mode: str = "updates",
-):
-    """Run a single turn of an async LangGraph graph."""
+) -> float:
+    """Run a single turn of an async LangGraph graph. Returns total duration in seconds."""
     input_data = prepare_agent_input(message=message)
+    start_time = time.time()
 
     while True:
         has_interrupt = False
@@ -505,6 +527,8 @@ async def run_single_turn_async(
         else:
             break
 
+    return time.time() - start_time
+
 
 def run_single_turn_sync(
     graph,
@@ -513,9 +537,10 @@ def run_single_turn_sync(
     interactive: bool = True,
     verbose: bool = False,
     stream_mode: str = "updates",
-):
-    """Run a single turn of a sync LangGraph graph."""
+) -> float:
+    """Run a single turn of a sync LangGraph graph. Returns total duration in seconds."""
     input_data = prepare_agent_input(message=message)
+    start_time = time.time()
 
     while True:
         has_interrupt = False
@@ -549,6 +574,8 @@ def run_single_turn_sync(
         else:
             break
 
+    return time.time() - start_time
+
 
 def run_conversation_loop(
     graph,
@@ -574,11 +601,12 @@ def run_conversation_loop(
         print(separator())
 
         if use_async:
-            asyncio.run(
+            duration = asyncio.run(
                 run_single_turn_async(graph, initial_message, config, interactive, verbose, stream_mode)
             )
         else:
-            run_single_turn_sync(graph, initial_message, config, interactive, verbose, stream_mode)
+            duration = run_single_turn_sync(graph, initial_message, config, interactive, verbose, stream_mode)
+        print_timing(duration, verbose)
         print()
 
     # Main conversation loop
@@ -610,11 +638,12 @@ def run_conversation_loop(
 
             # Run the agent
             if use_async:
-                asyncio.run(
+                duration = asyncio.run(
                     run_single_turn_async(graph, user_input, config, interactive, verbose, stream_mode)
                 )
             else:
-                run_single_turn_sync(graph, user_input, config, interactive, verbose, stream_mode)
+                duration = run_single_turn_sync(graph, user_input, config, interactive, verbose, stream_mode)
+            print_timing(duration, verbose)
             print()
 
         except (EOFError, KeyboardInterrupt):
