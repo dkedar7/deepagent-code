@@ -2,6 +2,8 @@
 
 A Claude Code-style CLI for running LangGraph agents from the terminal.
 
+![deepagent-code](examples/image.png)
+
 ## Installation
 
 ```bash
