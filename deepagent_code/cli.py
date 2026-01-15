@@ -124,6 +124,26 @@ class CommandRegistry:
 command_registry = CommandRegistry()
 
 
+def rl_wrap(code: str) -> str:
+    """Wrap ANSI escape code for readline to ignore in length calculations.
+
+    On terminals, ANSI codes are invisible but counted in string length.
+    This causes issues with line wrapping when using input().
+    Wrapping with \\001 and \\002 tells readline to ignore these characters.
+    """
+    if HAS_READLINE:
+        return f"\001{code}\002"
+    return code
+
+
+def make_prompt(text: str = "❯", color: str = BRIGHT_BLUE) -> str:
+    """Create a prompt string with proper readline escaping for ANSI codes.
+
+    This prevents line wrapping issues on Windows and other terminals.
+    """
+    return f"{rl_wrap(BOLD)}{rl_wrap(color)}{text}{rl_wrap(RESET)} "
+
+
 def register_command(
     name: str,
     description: str,
@@ -647,7 +667,7 @@ def handle_interrupt_input(num_actions: int = 1) -> List[Dict[str, Any]]:
         return [{"type": "reject"} for _ in range(num_actions)]
     elif choice == 2:
         print("Enter your decision as JSON (will be applied to all actions):")
-        json_str = input(f"{BOLD}{BLUE}❯{RESET} ").strip()
+        json_str = input(make_prompt("❯", BLUE)).strip()
         try:
             decision = json.loads(json_str)
             return [decision for _ in range(num_actions)]
@@ -1119,7 +1139,7 @@ def run_conversation_loop(
     while True:
         try:
             print(separator("dots"))
-            user_input = input(f"{BOLD}{BRIGHT_BLUE}❯{RESET} ").strip()
+            user_input = input(make_prompt()).strip()
 
             if not user_input:
                 continue
