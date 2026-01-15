@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3] - 2026-01-15
+
+### Fixed
+- Line wrapping issues on Windows terminals when entering long user messages
+- Proper readline escape sequences for ANSI codes in input prompts
+
 ## [0.1.2] - 2026-01-13
 
 ### Added
