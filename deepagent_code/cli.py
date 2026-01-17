@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -1195,6 +1196,28 @@ def run_conversation_loop(
                         print(f"{DIM}Did you mean: {suggestion_str}?{RESET}")
                     else:
                         print(f"{DIM}Type /help to see available commands{RESET}")
+                continue
+
+            # Handle bang commands (!) - execute bash directly
+            if user_input.startswith("!"):
+                bash_cmd = user_input[1:].strip()
+                if bash_cmd:
+                    print()
+                    try:
+                        result = subprocess.run(
+                            bash_cmd,
+                            shell=True,
+                            capture_output=True,
+                            text=True,
+                        )
+                        if result.stdout:
+                            print(result.stdout, end="")
+                        if result.stderr:
+                            print(f"{RED}{result.stderr}{RESET}", end="")
+                        if result.returncode != 0:
+                            print(f"{DIM}Exit code: {result.returncode}{RESET}")
+                    except Exception as e:
+                        print(f"{RED}Error executing command: {e}{RESET}")
                 continue
 
             # Handle "exit" as a special case (without slash)
