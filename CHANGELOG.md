@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.4] - 2026-01-17
+
+### Added
+- ASCII art rendering for agent names in header display
+- Agent description display below agent name (if available)
+- Bang command (`!`) prefix to execute bash commands directly, bypassing agent
+- `cwd:` label before current working directory display
+
+### Changed
+- Renamed `DEEPAGENT_AGENT_SPEC` to `DEEPAGENT_SPEC` (backwards compatible)
+- Improved M character in ASCII font for better distinction from N
+
+### Fixed
+- ASCII art alignment issues for characters with trailing spaces (T, P, etc.)
+
 ## [0.1.3] - 2026-01-15
 
 ### Fixed
