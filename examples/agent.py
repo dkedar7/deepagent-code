@@ -42,3 +42,4 @@ agent = create_deep_agent(
     tools=[bash],
     interrupt_on=dict(bash=True)
 )
+agent.description = "A helpful assistant that can read and write files, and execute bash commands."

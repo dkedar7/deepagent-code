@@ -256,8 +256,24 @@ def get_agent_name(graph) -> str:
     return "AgentCode"
 
 
-def print_header_box(agent_name: str, cwd: str):
-    """Print an elegant header with the agent name and version."""
+def get_agent_description(graph) -> Optional[str]:
+    """Extract agent description from graph object, if available."""
+    # Try common attribute names for agent description
+    for attr in ('description', 'agent_description', '_description', '__doc__'):
+        if hasattr(graph, attr):
+            desc = getattr(graph, attr)
+            if desc and isinstance(desc, str) and desc.strip():
+                return desc.strip()
+    # Check if it's a compiled graph with a description in builder
+    if hasattr(graph, 'builder') and hasattr(graph.builder, 'description'):
+        desc = graph.builder.description
+        if desc and isinstance(desc, str) and desc.strip():
+            return desc.strip()
+    return None
+
+
+def print_header_box(agent_name: str, cwd: str, description: Optional[str] = None):
+    """Print an elegant header with the agent name, optional description, and cwd."""
     term_width = get_terminal_width()
 
     # Box drawing characters
@@ -269,13 +285,26 @@ def print_header_box(agent_name: str, cwd: str):
 
     # Build the header content
     title_line = agent_name.center(inner_width)
-    cwd_display = cwd if len(cwd) <= inner_width else "..." + cwd[-(inner_width - 3):]
-    cwd_line = cwd_display.center(inner_width)
+
+    # Build cwd line with label
+    cwd_label = "Current dir: "
+    max_cwd_len = inner_width - len(cwd_label)
+    cwd_display = cwd if len(cwd) <= max_cwd_len else "..." + cwd[-(max_cwd_len - 3):]
+    cwd_with_label = f"{cwd_label}{cwd_display}"
+    cwd_line = cwd_with_label.center(inner_width)
 
     # Print the box with gradient-style coloring
     print()
     print(f"{BRIGHT_CYAN}{TL}{H * (term_width - 2)}{TR}{RESET}")
     print(f"{BRIGHT_CYAN}{V}{RESET} {BOLD}{BRIGHT_CYAN}{title_line}{RESET} {BRIGHT_CYAN}{V}{RESET}")
+
+    # Print description line if available
+    if description:
+        # Truncate description if too long
+        desc_display = description if len(description) <= inner_width else description[:inner_width - 3] + "..."
+        desc_line = desc_display.center(inner_width)
+        print(f"{CYAN}{V}{RESET} {DIM}{ITALIC}{desc_line}{RESET} {CYAN}{V}{RESET}")
+
     print(f"{CYAN}{V}{RESET} {DIM}{cwd_line}{RESET} {CYAN}{V}{RESET}")
     print(f"{CYAN}{BL}{H * (term_width - 2)}{BR}{RESET}")
 
@@ -1090,6 +1119,7 @@ def run_conversation_loop(
     graph,
     config: Dict[str, Any],
     agent_name: str = "AgentCode",
+    agent_description: Optional[str] = None,
     use_async: bool = False,
     interactive: bool = True,
     verbose: bool = False,
@@ -1103,8 +1133,8 @@ def run_conversation_loop(
     # Set up tab completion for slash commands
     setup_readline_completion()
 
-    # Print box-drawn header with agent name
-    print_header_box(agent_name, os.getcwd())
+    # Print box-drawn header with agent name and description
+    print_header_box(agent_name, os.getcwd(), agent_description)
 
     # Print welcome message with tips
     print_welcome()
@@ -1331,14 +1361,16 @@ def main(
         if "thread_id" not in config_dict["configurable"]:
             config_dict["configurable"]["thread_id"] = str(uuid.uuid4())
 
-        # Extract agent name from graph object
+        # Extract agent name and description from graph object
         agent_name = get_agent_name(graph)
+        agent_description = get_agent_description(graph)
 
         # Run the conversation loop
         run_conversation_loop(
             graph=graph,
             config=config_dict,
             agent_name=agent_name,
+            agent_description=agent_description,
             use_async=use_async,
             interactive=interactive,
             verbose=verbose,
