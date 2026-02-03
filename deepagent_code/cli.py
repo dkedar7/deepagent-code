@@ -1202,10 +1202,13 @@ def run_conversation_loop(
     verbose: bool = False,
     stream_mode: str = "updates",
     initial_message: Optional[str] = None,
+    single_shot: bool = False,
 ):
     """
     Run a continuous conversation loop with the LangGraph agent.
     Styled after Claude Code / nanocode.
+
+    If single_shot is True and initial_message is provided, exit after processing.
     """
     # Set up tab completion for slash commands
     setup_readline_completion()
@@ -1241,6 +1244,10 @@ def run_conversation_loop(
             duration = run_single_turn_sync(graph, initial_message, config, interactive, verbose, stream_mode)
         print_timing(duration, verbose)
         print()
+
+        # Exit after single-shot execution
+        if single_shot:
+            return
 
     # Main conversation loop
     while True:
@@ -1322,16 +1329,24 @@ def run_conversation_loop(
 
 
 @click.command()
-@click.argument("agent_spec", required=False)
+@click.argument("message", required=False)
+@click.option(
+    "--agent",
+    "-a",
+    "agent_spec",
+    help="Agent spec: path/to/file.py, path/to/file.py:graph, or module.path:graph",
+)
 @click.option(
     "--graph-name",
     "-g",
     help="Name of the graph variable (default: 'graph', overridden if spec includes :name)",
 )
 @click.option(
-    "--message",
-    "-m",
-    help="Input message to send to the agent",
+    "--file",
+    "-f",
+    "prompt_file",
+    type=click.Path(exists=True),
+    help="Read input message from a file (any extension)",
 )
 @click.option(
     "--config",
@@ -1360,9 +1375,10 @@ def run_conversation_loop(
     help="Show verbose output including node names",
 )
 def main(
+    message: Optional[str],
     agent_spec: Optional[str],
     graph_name: Optional[str],
-    message: Optional[str],
+    prompt_file: Optional[str],
     config: Optional[str],
     interactive: bool,
     use_async: bool,
@@ -1372,7 +1388,9 @@ def main(
     """
     Run a LangGraph agent from the command line.
 
-    AGENT_SPEC can be:
+    MESSAGE is an optional input to send to the agent immediately.
+
+    Agent spec (-a/--agent) can be:
     \b
     - path/to/file.py           (uses default graph name 'graph')
     - path/to/file.py:agent     (specifies graph variable name)
@@ -1391,12 +1409,28 @@ def main(
 
     \b
     Examples:
-        deepagent-code my_agent.py
-        deepagent-code my_agent.py:graph
-        deepagent-code mypackage.agents:chatbot
-        deepagent-code -m "Hello, agent!"
+        deepagent-code "Hello, agent!"
+        deepagent-code -a my_agent.py "What can you do?"
+        deepagent-code -a my_agent.py:graph
+        deepagent-code -f ./prompt.md
     """
     try:
+        # Handle -f/--file option: read message from file
+        if prompt_file and message:
+            print(f"{RED}⏺ Error: Cannot use both MESSAGE argument and -f/--file option{RESET}")
+            sys.exit(1)
+
+        if prompt_file:
+            try:
+                with open(prompt_file, 'r', encoding='utf-8') as f:
+                    message = f.read().strip()
+                if not message:
+                    print(f"{RED}⏺ Error: File '{prompt_file}' is empty{RESET}")
+                    sys.exit(1)
+            except Exception as e:
+                print(f"{RED}⏺ Error reading file '{prompt_file}': {e}{RESET}")
+                sys.exit(1)
+
         # Get environment variables (DEEPAGENT_SPEC preferred, DEEPAGENT_AGENT_SPEC for backwards compat)
         env_agent_spec = os.getenv('DEEPAGENT_SPEC') or os.getenv('DEEPAGENT_AGENT_SPEC')
         env_workspace_root = os.getenv('DEEPAGENT_WORKSPACE_ROOT')
@@ -1465,6 +1499,7 @@ def main(
         agent_description = get_agent_description(graph)
 
         # Run the conversation loop
+        # Single-shot mode: exit after processing if message was provided via CLI
         run_conversation_loop(
             graph=graph,
             config=config_dict,
@@ -1475,6 +1510,7 @@ def main(
             verbose=verbose,
             stream_mode=final_stream_mode,
             initial_message=message,
+            single_shot=bool(message),
         )
 
     except FileNotFoundError as e:
