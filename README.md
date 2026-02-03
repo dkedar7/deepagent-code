@@ -25,7 +25,7 @@ deepagent-code
 
 Or specify your own agent:
 ```bash
-deepagent-code path/to/your_agent.py:graph
+deepagent-code -a path/to/your_agent.py:graph
 ```
 
 This launches an interactive conversation loop with your agent.
@@ -36,14 +36,17 @@ This launches an interactive conversation loop with your agent.
 # Use the default agent
 deepagent-code
 
+# Send a message directly
+deepagent-code "Hello, agent!"
+
 # Specify a custom agent file
-deepagent-code my_agent.py:graph
+deepagent-code -a my_agent.py:graph
 
 # Use a module path
-deepagent-code mypackage.agents:chatbot
+deepagent-code -a mypackage.agents:chatbot
 
-# With an initial message
-deepagent-code -m "Hello, agent!"
+# Read message from a file
+deepagent-code -f ./prompt.md
 
 # Non-interactive mode (auto-approve tool calls)
 deepagent-code --no-interactive
@@ -76,14 +79,15 @@ export DEEPAGENT_CONFIG='{"configurable": {"thread_id": "1"}}'
 ## CLI Options
 
 ```
-Usage: deepagent-code [OPTIONS] [AGENT_SPEC]
+Usage: deepagent-code [OPTIONS] [MESSAGE]
 
 Arguments:
-  AGENT_SPEC  Agent location (path/to/file.py:graph or module:graph)
+  MESSAGE  Optional input to send to the agent immediately
 
 Options:
+  -a, --agent TEXT                Agent spec (path/to/file.py:graph or module:graph)
   -g, --graph-name TEXT           Graph variable name (default: "graph")
-  -m, --message TEXT              Initial message
+  -f, --file PATH                 Read message from a file (any extension)
   -c, --config TEXT               Config JSON or file path
   --interactive/--no-interactive  Handle interrupts (default: interactive)
   --async-mode/--sync-mode        Async streaming (default: sync)
@@ -108,7 +112,7 @@ agent = create_deep_agent(
 
 Then run it:
 ```bash
-deepagent-code my_agent.py:agent
+deepagent-code -a my_agent.py:agent
 ```
 
 ## Programmatic Use
