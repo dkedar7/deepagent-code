@@ -201,3 +201,34 @@ def test_non_streaming_tool_agent_surfaces_tool_call_and_result():
     assert results and results[0]["tool_result"] == "Sunny, 24C", (
         "tool result dropped on the CLI snapshot path (needs langstage-core >= 1.0.24, gh #91)"
     )
+
+
+def test_plain_string_interrupt_reaches_the_renderer_with_its_payload():
+    """gh #95: a bare-string interrupt("Approve X?") must surface its text to the CLI,
+    not "(no action details provided)". The fix is in langstage-core (>= 1.0.28, on the
+    chunk wire the CLI consumes); this pins that the frame carries the string and the
+    CLI renderer shows it."""
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.types import interrupt
+
+    from langstage_cli.cli import format_interrupt_request
+
+    def ask(state):
+        interrupt("Approve deleting ALL files in /home? (y/n)")
+        return {"messages": [AIMessage(content="done")]}
+
+    b = StateGraph(MessagesState)
+    b.add_node("ask", ask)
+    b.add_edge(START, "ask")
+    b.add_edge("ask", END)
+    agent = build_session_agent(b.compile(checkpointer=MemorySaver()))
+
+    chunks = _collect(agent, "go")
+    interrupts = [c for c in chunks if c.get("status") == "interrupt"]
+    assert interrupts, chunks
+    ars = interrupts[0]["interrupt"]["action_requests"]
+    assert ars == ["Approve deleting ALL files in /home? (y/n)"], (
+        "string interrupt dropped (needs core >= 1.0.28, gh #95)"
+    )
+    # the renderer surfaces the string (not "(no action details provided)")
+    assert format_interrupt_request(ars[0])[0] == "Approve deleting ALL files in /home? (y/n)"
