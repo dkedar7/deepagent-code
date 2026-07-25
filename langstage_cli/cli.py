@@ -4,6 +4,7 @@ Styled after Claude Code / nanocode.
 """
 
 import asyncio
+import copy
 import json
 import os
 import re
@@ -1127,6 +1128,63 @@ def cmd_status(args: str, context: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _live_resolved_report(config: Dict[str, Any], context: Dict[str, Any]) -> str:
+    """Render the full resolved-config diagnostic from LIVE runtime state (gh #97).
+
+    Bare ``/config`` used to print ``_resolved_config_report`` — a string frozen at
+    startup — so after a runtime mutation (``/verbose``, ``/config verbose on``,
+    ``/reset``) it contradicted ``/status``, the single-key ``/config <key>`` read, and
+    even its own ``✓ Set`` line, and mislabelled an overridden value ``[default]``.
+
+    Instead we re-render the ONE ``describe()`` diagnostic from the ``CodeConfig``
+    resolved at startup, overlaid with live state: ``verbose`` from
+    ``context["verbose"]`` and the live ``[configurable]`` values (so a ``/reset``
+    thread_id shows through). The stored cfg keeps its startup-frozen
+    ``_sources``/``_toml_paths``, so this RE-RENDERS rather than RE-RESOLVES — it can't
+    pick up the ``LANGSTAGE_WORKSPACE_ROOT`` that ``apply_workspace`` self-publishes, so
+    the #64 fix still holds and static keys keep their true provenance.
+
+    A field changed at runtime is relabelled ``[override]`` (never ``[default]``),
+    reusing ``describe()``'s own source vocabulary so the live view agrees with
+    ``/status`` and ``/config <key>``. Falls back to the frozen snapshot string only
+    when the resolved cfg is unavailable (e.g. a hand-built test context).
+    """
+    resolved_cfg = config.get("_resolved_config")
+    if resolved_cfg is None:
+        # No live cfg to render from: honour the startup snapshot as-is, and only
+        # re-resolve if even that is absent (never re-resolve otherwise — gh #64).
+        report = config.get("_resolved_config_report")
+        if report is None:
+            from langstage_cli.config import CodeConfig
+
+            report = CodeConfig.resolve().describe(
+                omit_keys=_INERT_KEYS, configurable=config.get("configurable") or None
+            )
+        return report
+
+    # Overlay the one runtime-mutable field (verbose) onto a copy, keeping every static
+    # key's frozen provenance. Relabel it [override] only when it actually differs from
+    # the startup-resolved value, so an unchanged value keeps its true source.
+    live_cfg = copy.copy(resolved_cfg)
+    live_cfg._sources = dict(resolved_cfg.sources)
+    live_verbose = context.get("verbose", resolved_cfg.verbose)
+    if live_verbose != resolved_cfg.verbose:
+        live_cfg.verbose = live_verbose
+        live_cfg._sources["verbose"] = "override"
+
+    # Overlay live [configurable] values onto the startup key set, so /reset's new
+    # thread_id shows through while the table's shape stays byte-identical to startup
+    # (a key absent at startup — e.g. an auto thread_id when the TOML set none — stays
+    # hidden, keeping /config's table matching --show-config's).
+    snap_conf = config.get("_snap_configurable")
+    live_conf = config.get("configurable") or {}
+    overlaid = None
+    if isinstance(snap_conf, dict) and snap_conf:
+        overlaid = {k: live_conf.get(k, v) for k, v in snap_conf.items()}
+
+    return live_cfg.describe(omit_keys=_INERT_KEYS, configurable=overlaid)
+
+
 @register_command(
     name="config",
     description="Show or set configuration",
@@ -1150,18 +1208,13 @@ def cmd_config(args: str, context: Dict[str, Any]) -> Optional[str]:
             print(f"  {DIM}TOML sources:{RESET} {DIM}(none — using defaults){RESET}")
 
         # Full resolved view — the COMPLETE describe() diagnostic (fields + source +
-        # env/TOML keys + the [configurable] table). Prefer the snapshot captured at
-        # startup (before apply_workspace self-published LANGSTAGE_WORKSPACE_ROOT), so
-        # workspace_root's source is truthful and /config renders byte-for-byte what
-        # --show-config prints — both go through the one describe() (gh #64, #66).
-        # Fall back to a fresh resolve only if the snapshot is somehow absent.
-        report = config.get("_resolved_config_report")
-        if report is None:
-            from langstage_cli.config import CodeConfig
-
-            report = CodeConfig.resolve().describe(
-                omit_keys=_INERT_KEYS, configurable=config.get("configurable") or None
-            )
+        # env/TOML keys + the [configurable] table), RE-RENDERED from live state so it
+        # reflects runtime mutations (/verbose, /config verbose on, /reset) and agrees
+        # with /status and /config <key> instead of contradicting them (gh #97). This
+        # re-renders the startup-resolved cfg (frozen provenance) rather than
+        # re-resolving, so workspace_root's source stays truthful — the #64 fix holds —
+        # and the startup table still matches --show-config byte-for-byte (gh #64, #66).
+        report = _live_resolved_report(config, context)
         for line in report.splitlines():
             print(f"  {line}")
         print()
@@ -1954,6 +2007,15 @@ def main(
         # The resolved-config diagnostic snapshotted before apply_workspace, so /config
         # reports the true source of workspace_root instead of the self-published env (gh #64).
         config_dict["_resolved_config_report"] = resolved_config_report
+        # Also stash the resolved CodeConfig object itself (with its startup-frozen
+        # provenance) and the snapshot [configurable] key set, so bare /config can
+        # RE-RENDER the same describe() diagnostic from live state — reflecting runtime
+        # mutations (/verbose, /config verbose on, /reset) instead of the frozen string,
+        # while still never re-resolving (so #64's self-published-env fix holds). (gh #97)
+        config_dict["_resolved_config"] = cfg
+        config_dict["_snap_configurable"] = (
+            _snap_configurable if isinstance(_snap_configurable, dict) else None
+        )
 
         # Extract agent name and description from graph object
         agent_name = get_agent_name(graph)
