@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.6.25 - 2026-07-25
+
+### Fixed
+- **Bare `/config` now renders the LIVE configuration, so after a runtime change it agrees with
+  `/status`, the single-key `/config <key>` read, and its own `✓ Set` line instead of
+  contradicting all three (gh #97).** The full-table `/config` view printed
+  `_resolved_config_report` — a string snapshotted at startup and never updated — while every
+  other reader and setter uses the live `context`: `/config verbose on` sets `context["verbose"]`,
+  `/config verbose` and `/status` read it back, and `/reset` mutates
+  `context["config"]["configurable"]["thread_id"]`. So after `/verbose on` the table still showed
+  `verbose = False [default]` even as `/status` said `on` and `/config verbose` said `True`, and
+  after `/reset` it kept printing the pre-reset `thread_id`. Worse, the frozen string carried a
+  wrong **source** label — `[default]` for a value the user had actually overridden — so a user
+  who set a value and re-ran `/config` to confirm saw it reported as unset and could reasonably
+  conclude the set had silently failed. Bare `/config` now RE-RENDERS the one `describe()`
+  diagnostic (the same renderer `--show-config` uses) from the `CodeConfig` resolved at startup,
+  overlaid with live state: `verbose` from `context["verbose"]` (relabelled `[override]`, never
+  `[default]`, when it differs from the resolved value) and the live `[configurable]` values (so a
+  `/reset` thread_id shows through). Crucially this RE-RENDERS the startup-resolved cfg — whose
+  per-field provenance is frozen — rather than RE-RESOLVING, so it still can't pick up the
+  `LANGSTAGE_WORKSPACE_ROOT` that `apply_workspace()` self-publishes: the #64 fix holds and the
+  no-mutation startup table stays byte-for-byte identical to `--show-config`. Same
+  "two provenance views disagree" family as #64 / #66 / #79, now closed for the full `/config`
+  table. `--show-config` (the non-interactive flag) is unaffected.
+
 ## 0.6.24 - 2026-07-25
 
 ### Fixed
