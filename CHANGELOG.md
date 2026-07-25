@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.24 - 2026-07-25
+
+### Fixed
+- **A plain-string `interrupt("Approve deleting X?")` — the canonical LangGraph HITL form — now
+  shows the human what they're approving, instead of "(no action details provided)" (gh #95).**
+  The approval menu dropped the payload of a bare-string/scalar interrupt (dict payloads rendered
+  fine), so a confirmation like `interrupt("Approve deleting ALL files in /home?")` asked the user
+  to Approve/Reject blind — defeating the point of HITL. The renderer already handled a scalar
+  (`format_interrupt_request` returns `str(action)`); the payload was dropped upstream in
+  `langstage-core`'s `on_interrupt` handler, which `json.loads()`'d the string, failed on a
+  non-JSON question, and fell back to an empty request. Fixed in **langstage-core 1.0.28** on the
+  chunk wire the CLI consumes; this raises the floor to `>= 1.0.28` so a fresh install gets it.
+
 ## 0.6.23 - 2026-07-23
 
 ### Fixed
