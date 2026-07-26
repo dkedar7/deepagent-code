@@ -679,6 +679,27 @@ def _compact_repr(value: Any) -> str:
     return text if len(text) <= 120 else text[:120] + "..."
 
 
+def _is_generic_interrupt(action_requests: List[Any]) -> bool:
+    """Whether an interrupt is a generic/scalar ``interrupt(value)`` rather than a
+    deepagents tool-REVIEW interrupt — the same distinction #82/#95 draw when
+    RENDERING, applied to the RESUME (gh #99).
+
+    A deepagents/langchain ``ActionRequest`` is a dict keyed ``action`` (the #69
+    convention) or the legacy ``tool``; its contract is the tool-review protocol,
+    so it resumes with a ``{"decisions": [...]}`` envelope. Anything else — a bare
+    string / scalar (the canonical ``value = interrupt("What is your name?")``
+    form, which core surfaces as a single string action request), or a plain dict
+    without that key — is generic: its contract is "``interrupt`` returns exactly
+    what I was resumed with", so it must resume with the RAW value the user gives,
+    never a ``{"decisions": [...]}`` approval envelope it never asked for.
+    """
+    if not action_requests:
+        return True
+    return not all(
+        isinstance(a, dict) and (a.get("action") or a.get("tool")) for a in action_requests
+    )
+
+
 def format_result_preview(result: str) -> str:
     """Format a result preview with line count indicator."""
     if not result:
@@ -959,15 +980,22 @@ def select_option(options: List[str], prompt: str = "Select an option:") -> int:
         print("\033[?25h", end="")
 
 
-def handle_interrupt_input(num_actions: int = 1) -> List[Dict[str, Any]]:
+def handle_interrupt_input(num_actions: int = 1, is_generic: bool = False) -> Any:
     """
-    Handle user input for interrupt decisions using arrow key navigation.
+    Handle user input for an interrupt using arrow key navigation, returning the
+    value to resume the graph with (the ``command.resume`` payload).
 
     Args:
         num_actions: Number of pending tool calls that need decisions
+        is_generic: True for a generic/scalar ``interrupt(value)`` (gh #99), False
+            for a deepagents tool-REVIEW interrupt.
 
     Returns:
-        List of decision objects (one for each pending action)
+        For a deepagents tool-review interrupt, a ``{"decisions": [...]}`` envelope
+        (unchanged — the tool-review protocol). For a generic interrupt, the RAW
+        value the user provides, UNWRAPPED, so ``value = interrupt("What is your
+        name?")`` gets exactly that value back instead of a ``{"decisions": [...]}``
+        envelope it never asked for (gh #99).
     """
     # The approval menu is arrow-key driven, so it needs a real terminal on stdin.
     # Without this guard a piped / CI / cron run (`… "do X" </dev/null`) printed the
@@ -987,6 +1015,24 @@ def handle_interrupt_input(num_actions: int = 1) -> List[Dict[str, Any]]:
         )
         sys.exit(1)
 
+    if is_generic:
+        # A generic interrupt() asks for an arbitrary value, not tool approval, so
+        # "Approve/Reject" have no meaning and wrapping the answer in
+        # {"decisions": [...]} corrupts it (gh #99). Collect a raw value and resume
+        # with it UNWRAPPED. JSON is attempted first so a structured value (number,
+        # list, dict) survives; a non-JSON entry is used verbatim as a string — the
+        # canonical `value = interrupt("What is your name?")` case, where the user
+        # types `Alice` and the agent must receive `"Alice"`, not an envelope.
+        options = ["Provide a response", "Exit"]
+        choice = select_option(options, "How would you like to respond?")
+        if choice != 0:
+            sys.exit(0)
+        raw = input(make_prompt("❯", BLUE))
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
+
     options = [
         "Approve all actions",
         "Reject all actions",
@@ -997,20 +1043,20 @@ def handle_interrupt_input(num_actions: int = 1) -> List[Dict[str, Any]]:
     choice = select_option(options, "How would you like to proceed?")
 
     if choice == 0:
-        # Return approve decision for each pending action
-        return [{"type": "approve"} for _ in range(num_actions)]
+        # Approve decision for each pending action
+        return {"decisions": [{"type": "approve"} for _ in range(num_actions)]}
     elif choice == 1:
-        # Return reject decision for each pending action
-        return [{"type": "reject"} for _ in range(num_actions)]
+        # Reject decision for each pending action
+        return {"decisions": [{"type": "reject"} for _ in range(num_actions)]}
     elif choice == 2:
         print("Enter your decision as JSON (will be applied to all actions):")
         json_str = input(make_prompt("❯", BLUE)).strip()
         try:
             decision = json.loads(json_str)
-            return [decision for _ in range(num_actions)]
+            return {"decisions": [decision for _ in range(num_actions)]}
         except json.JSONDecodeError as e:
             print(f"{RED}⏺ Invalid JSON: {e}{RESET}")
-            return [{"type": "reject"} for _ in range(num_actions)]
+            return {"decisions": [{"type": "reject"} for _ in range(num_actions)]}
     else:
         sys.exit(0)
 
@@ -1432,6 +1478,7 @@ async def run_single_turn_agui(
     while True:
         has_interrupt = False
         num_pending_actions = 0
+        is_generic_interrupt = False
         first_chunk = True
         # No spinner in quiet mode — its \r animation is terminal-only chrome that
         # would corrupt a piped reply. (gh #53)
@@ -1452,13 +1499,25 @@ async def run_single_turn_agui(
                     interrupt_data = chunk.get("interrupt", {})
                     action_requests = interrupt_data.get("action_requests", [])
                     num_pending_actions = len(action_requests) if action_requests else 1
+                    is_generic_interrupt = _is_generic_interrupt(action_requests)
         finally:
             if spinner:
                 spinner.stop()
 
         if has_interrupt and interactive:
-            decisions = handle_interrupt_input(num_pending_actions)
-            resume = {"decisions": decisions}
+            resume = handle_interrupt_input(num_pending_actions, is_generic=is_generic_interrupt)
+        elif has_interrupt and is_generic_interrupt:
+            # --no-interactive on a generic interrupt() (gh #99): there is no action
+            # to "approve", and resuming with a {"decisions": [...]} envelope would
+            # hand the agent an approval it never asked for (`Hello, {'decisions':
+            # [...]}!`). Nobody can supply the requested value non-interactively, so
+            # resume with an empty value — a value the agent could plausibly have
+            # received — keeping the "run to completion" contract without lying.
+            _status(
+                f"{DIM}Auto-resuming generic interrupt with an empty value "
+                f"(--no-interactive){RESET}"
+            )
+            resume = ""
         elif has_interrupt:
             # --no-interactive: auto-approve and resume so the agent runs to
             # completion (same behavior as the default path, gh #32).

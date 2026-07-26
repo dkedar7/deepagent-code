@@ -12,6 +12,10 @@ from click.testing import CliRunner
 
 from langstage_cli.cli import main
 
+# A deepagents-style tool-REVIEW interrupt (dict keyed `action`) — the shape for
+# which "approve" is meaningful, so --no-interactive genuinely auto-approves it and
+# resumes with the {"decisions": [...]} envelope. (A generic interrupt() has no
+# action to approve; its --no-interactive path is covered in test_generic_interrupt.py.)
 _HITL_AGENT = textwrap.dedent(
     """
     from langgraph.graph import StateGraph, START, END
@@ -21,7 +25,7 @@ _HITL_AGENT = textwrap.dedent(
     from langchain_core.messages import AIMessage
 
     def ask(state):
-        decision = interrupt({"question": "Approve this action?"})
+        decision = interrupt({"action": "delete_file", "path": "/etc/hosts"})
         return {"messages": [AIMessage(content=f"Decision was: {decision}")]}
 
     g = StateGraph(MessagesState)
@@ -43,3 +47,5 @@ def test_no_interactive_auto_approves_and_resumes(tmp_path, monkeypatch):
     # node ran and rendered its content, instead of the interrupt being dropped.
     assert "Auto-approving" in r.output
     assert "Decision was:" in r.output
+    # A tool-review interrupt resumes with the approval envelope (gh #99 keeps this).
+    assert "approve" in r.output
