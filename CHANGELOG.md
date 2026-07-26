@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.6.26 - 2026-07-26
+
+### Fixed
+- **A generic `interrupt(value)` now resumes with the RAW value the user provides, so
+  `name = interrupt("What is your name?")` gets the answer back instead of an approval
+  envelope it never asked for (gh #99).** #82 / #95 fixed DISPLAYING a generic
+  `interrupt(...)`; this closes the matching RESUME gap. The CLI built the resume payload
+  unconditionally as `{"decisions": [...]}` — the deepagents tool-REVIEW protocol — and forwarded
+  it verbatim as `command.resume`, which becomes the return value of `interrupt()`. So the
+  canonical LangGraph "collect input from a human" pattern received
+  `{"decisions": [{"type": "approve"}]}` and produced the visibly wrong
+  `Hello, {'decisions': [{'type': 'approve'}]}!`; even "Provide custom decision (JSON)" wrapped the
+  typed value inside the envelope, leaving no workaround. The resume now branches on the same signal
+  #82/#95 use to render: a deepagents tool-review interrupt (an `action_request` dict keyed `action`,
+  or the legacy `tool`) keeps the `{"decisions": [...]}` envelope unchanged, while a generic / scalar
+  `interrupt(value)` — a bare string (the `"What is your name?"` form) or a plain dict without an
+  action key — resumes with the raw value the user enters, UNWRAPPED (JSON is parsed when it parses, so
+  a number / list / dict survives; otherwise the text is used verbatim as a string). Under
+  `--no-interactive`, where nobody can supply the requested value, a generic interrupt resumes with an
+  empty value rather than injecting a fake approval — keeping the "run to completion" contract without
+  handing the agent a decision it never mentioned.
+
 ## 0.6.25 - 2026-07-25
 
 ### Fixed
