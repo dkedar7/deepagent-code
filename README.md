@@ -64,6 +64,9 @@ This launches an interactive conversation loop with your agent.
 # Keyless demo agent — no API key, no agent of your own
 langstage-cli --demo "Hello"
 
+# Scaffold a runnable starter agent + langstage.toml (then just run it)
+langstage-cli init
+
 # Send a message directly to your agent
 langstage-cli -a my_agent.py:graph "Hello, agent!"
 
@@ -88,7 +91,46 @@ langstage-cli --demo
 # Print the resolved configuration: each value, its source, and the
 # env var / langstage.toml key that sets it
 langstage-cli --show-config
+
+# Resume a previous conversation across separate invocations
+langstage-cli "remember: my name is Kedar"   # a fresh, PERSISTED session
+langstage-cli -c "what's my name?"            # continue the most recent session
+langstage-cli --list-sessions                 # list resumable sessions
+langstage-cli --resume <id>                   # resume a specific one
 ```
+
+## Getting started with your own agent
+
+```bash
+langstage-cli --demo "hi"     # see the CLI work, keyless
+langstage-cli init            # scaffold my_agent.py + langstage.toml (your own graph)
+langstage-cli "hi"            # runs MY agent — no -a, no hand-editing
+```
+
+`init` writes a minimal, immediately-runnable starter agent (the stdlib `StateGraph`
+example below — needs only `langgraph`, a base dependency) plus a `langstage.toml`
+pointing at it, so the next `langstage-cli "..."` runs *your* graph. It refuses to
+overwrite an existing `my_agent.py` / `langstage.toml` unless you pass `--force`.
+
+## Resuming a session
+
+Every invocation persists its conversation to a durable, per-workspace store so a later
+run can pick it up — the terminal-agent continuity of Claude Code / Codex / Aider,
+without you baking a checkpointer into your own graph:
+
+- `--continue` / `-c` — resume the **most recent** session for this workspace and keep
+  going. If there's no prior session, it just starts a fresh one.
+- `--resume <id>` — resume a **specific** session (ids come from `--list-sessions`; a
+  bare `--resume` also lists them). A short prefix works if it's unambiguous.
+- A plain run with no flag starts a **new** session that is still persisted, so it can be
+  continued later.
+
+State lives in `~/.langstage/sessions/<workspace-hash>.sqlite` (honoring
+`LANGSTAGE_CONFIG_HOME`; override the whole location with `LANGSTAGE_CLI_SESSIONS_DIR`).
+Persistence is on by default — disable it with `--no-persist`, `LANGSTAGE_PERSIST=0`, or
+`[session] persist = false` in `langstage.toml`. A graph that compiles in its **own**
+checkpointer keeps it (yours always wins); the CLI only supplies a durable one when your
+graph has none. A pinned `[configurable] thread_id` now genuinely persists across runs.
 
 ## Commands
 
@@ -165,7 +207,15 @@ Options:
   --show-config                   Print the resolved configuration and exit
   -q, --quiet                     Scriptable single-shot output: only the reply
   --verify                        Preflight the agent (one real turn); exit 0/1
+  -c, --continue                  Resume the most recent session for this workspace
+  --resume [ID]                   Resume a specific session (bare: list them)
+  --list-sessions                 List resumable sessions for this workspace
+  --persist/--no-persist          Persist this session so it can be continued (default: on)
+  --force                         For `init`: overwrite existing files
   --version                       Show the version and exit
+
+Subcommand:
+  init                            Scaffold my_agent.py + langstage.toml in the current dir
 ```
 
 ### Verifying an agent (CI gate)

@@ -93,6 +93,32 @@ def test_show_config_omits_server_only_keys():
     assert re.search(r"^\s*agent_spec\s*=", r.output, re.MULTILINE), r.output
 
 
+def test_show_config_attributes_a_global_only_value_to_the_global_file(tmp_path, monkeypatch):
+    """gh #101: a value set ONLY in the global ~/.langstage/config.toml must be attributed
+    to the GLOBAL file in --show-config, not to the project langstage.toml.
+
+    Before the fix every toml-sourced value was stamped with the LAST file read (the
+    project file when both are merged), so ``workspace_root`` — set only globally — was
+    mislabelled ``[toml (langstage.toml)]`` and sent a debugging user to the wrong file.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    # workspace.root ONLY in the global config; agent.spec ONLY in the project config.
+    (home / "config.toml").write_text('[workspace]\nroot = "/tmp/GLOBAL_ONLY_DIR"\n')
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "langstage.toml").write_text('[agent]\nspec = "my_agent.py:graph"\n')
+    monkeypatch.setenv("LANGSTAGE_CONFIG_HOME", str(home))
+    monkeypatch.chdir(proj)
+
+    r = CliRunner().invoke(main, ["--show-config"])
+    assert r.exit_code == 0, r.output
+    # The global-only value names the GLOBAL file (config.toml), not the project file.
+    assert re.search(r"workspace_root\s*=.*\[toml \(config\.toml\)\]", r.output), r.output
+    # The project-only value still names the project file.
+    assert re.search(r"agent_spec\s*=.*\[toml \(langstage\.toml\)\]", r.output), r.output
+
+
 def test_show_config_title_env_not_advertised_as_effective():
     """Setting LANGSTAGE_TITLE must not show up as an in-effect value on a surface
     that ignores it (it would mislead the user). (gh #36)"""
