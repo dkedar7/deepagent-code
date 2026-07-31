@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.6.27 - 2026-07-31
+
+### Added
+- **First-class cross-invocation session persistence — `--continue` / `--resume` (gh #102).**
+  Every `langstage-cli` run used to be amnesiac: memory lived only for one process (an
+  in-memory checkpointer), so the second command in a workflow couldn't see the first.
+  The CLI now attaches a durable, per-workspace checkpointer **itself** — no user-supplied
+  saver, no graph edits — so a fresh run is persisted and a later run can resume it:
+  `--continue`/`-c` resumes the most recent session for the workspace (and starts fresh,
+  with a note, if there is none); `--resume <id>` resumes a specific thread (exact id or an
+  unambiguous prefix; a bare `--resume`, like `--list-sessions`, lists them); a plain run
+  starts a new-but-persisted session. `--continue` and `--resume` are mutually exclusive.
+  State lives at `~/.langstage/sessions/<workspace-hash>.sqlite` (honoring
+  `LANGSTAGE_CONFIG_HOME`; override the whole location with `LANGSTAGE_CLI_SESSIONS_DIR`),
+  with a small JSON index (thread id, timestamps, first-message snippet) driving `--continue`
+  and `--list-sessions`. Persistence is on by default (disable via `--no-persist`,
+  `LANGSTAGE_PERSIST=0`, or `[session] persist = false`); a graph that brings its own
+  checkpointer keeps it (yours always wins), and a pinned `[configurable] thread_id` now
+  genuinely persists across runs. Because the AG-UI streaming path is async-only — langgraph's
+  sync `SqliteSaver` raises `NotImplementedError` for the async checkpointer methods the graph
+  invokes — the durable saver is the async-native `AsyncSqliteSaver` over the same SQLite file,
+  opened and closed within each turn's own event loop (its aiosqlite connection can't cross
+  loops); `/status` surfaces persistence state and the store path. Adds a
+  `langgraph-checkpoint-sqlite` dependency.
+- **`langstage-cli init` scaffolds a runnable starter agent + `langstage.toml` (gh #104).**
+  Bridges the gap between `--demo` ("see the CLI work") and "run *my* graph": `init` writes a
+  minimal, immediately-runnable `my_agent.py` (the README's keyless stdlib `StateGraph`
+  example — needs only `langgraph`, a base dependency) plus a `langstage.toml` wired to it, so
+  the very next `langstage-cli "..."` runs the user's own graph with no `-a` and no
+  hand-editing. It refuses to overwrite an existing `my_agent.py` / `langstage.toml` unless
+  `--force` is passed, and prints exactly what it wrote plus the next step.
+
+### Fixed
+- **`--show-config` now attributes each merged TOML value to the file it ACTUALLY came from
+  (gh #101).** When a global `~/.langstage/config.toml` and a project `langstage.toml` were both
+  present and merged, the resolver stamped **every** TOML-sourced value with the last file it read
+  (the project file), so a value set only in the global config was mislabelled
+  `[toml (langstage.toml)]` — sending a user debugging "where did `workspace_root` come from?" to
+  the wrong file. Merge/precedence were always correct; only the displayed source filename lied.
+  The CLI now post-processes the resolved provenance, walking the same files in merge order
+  (project wins on conflicts) and relabelling each value with the highest-precedence file that
+  actually defines its key. A cli-local fix — it corrects the source map the shared resolver
+  produced without touching core.
+- **A free-text `interrupt()` resume no longer leaks an `ag_ui_langgraph` WARNING to the console
+  (gh #103).** On the interactive HITL path, answering a plain-string `interrupt(...)` with free
+  text made the bundled `ag_ui_langgraph` dependency log `failed to parse resume_input as JSON,
+  treating as string (...)` at WARNING on **every** response — an error-looking line printed right
+  above the (correct) answer, in default interactive mode, on the CLI's headline HITL feature. The
+  resumed value was always right; it was pure confusing noise. The CLI now installs a surgical
+  `logging.Filter` that drops **only** that one benign record on the emitting `ag_ui_langgraph`
+  logger during the interactive resume, so no other warning is ever hidden. cli-local by design —
+  the CLI owns its console UX, so no global logging filter lands in core.
+
 ## 0.6.26 - 2026-07-26
 
 ### Fixed

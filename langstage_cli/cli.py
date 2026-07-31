@@ -6,6 +6,7 @@ Styled after Claude Code / nanocode.
 import asyncio
 import copy
 import json
+import logging
 import os
 import re
 import subprocess
@@ -13,6 +14,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,6 +23,7 @@ import click
 
 from langstage_core import apply_workspace, load_agent_spec
 from langstage_cli import config as config_module
+from langstage_cli import sessions
 
 # Platform-specific imports for keyboard input
 IS_WINDOWS = sys.platform == "win32"
@@ -110,6 +113,56 @@ def _status(msg: str) -> None:
 # `async_mode`, inert since ADR 0003 collapsed every turn onto the one async AG-UI
 # path (gh #88).
 _INERT_KEYS = ["host", "port", "debug", "title", "stream_mode", "async_mode"]
+
+# Sentinel value of a bare ``--resume`` (no id): list this workspace's sessions instead
+# of resuming one. Matches the click option's ``flag_value``. (gh #102)
+_RESUME_LIST_SENTINEL = "__LIST__"
+
+# On the interactive HITL path, answering a plain-string ``interrupt(...)`` with free
+# text makes the bundled ``ag_ui_langgraph`` dep log a benign WARNING on EVERY response
+# — "failed to parse resume_input as JSON, treating as string (...)" — right above the
+# correct answer. The resumed value is right; the line just looks like an error. Drop
+# ONLY that one record so no other ag_ui_langgraph warning is ever hidden. cli-local by
+# design: the CLI owns its console UX, so this stays out of core. (gh #103)
+_AGUI_RESUME_JSON_WARNING = "failed to parse resume_input as JSON"
+
+# The warning is emitted by ``logging.getLogger("ag_ui_langgraph.agent")`` (the module
+# ``__name__``). A logger-level filter is consulted ONLY for records ORIGINATING on that
+# logger — during propagation ancestor-logger filters are skipped — so the filter must
+# sit on the emitting child logger (verified empirically). The package logger is added
+# too, defensively, in case a future version emits on it directly.
+_AGUI_WARNING_LOGGERS = ("ag_ui_langgraph.agent", "ag_ui_langgraph")
+
+
+class _DropResumeJSONWarning(logging.Filter):
+    """A surgical filter that removes ONLY ag_ui_langgraph's resume-JSON warning (gh #103)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 - a malformed record must never break logging
+            message = str(getattr(record, "msg", ""))
+        return _AGUI_RESUME_JSON_WARNING not in message
+
+
+@contextmanager
+def _quiet_agui_resume_json_warning():
+    """Drop ag_ui_langgraph's benign resume-JSON WARNING for the wrapped block (gh #103).
+
+    Installs the precise :class:`_DropResumeJSONWarning` filter on the emitting logger
+    for the duration and removes it after — so the noise is gone from the interactive
+    resume path while every OTHER warning still reaches the console.
+    """
+    filt = _DropResumeJSONWarning()
+    loggers = [logging.getLogger(name) for name in _AGUI_WARNING_LOGGERS]
+    for lg in loggers:
+        lg.addFilter(filt)
+    try:
+        yield
+    finally:
+        for lg in loggers:
+            lg.removeFilter(filt)
+
 
 # Spinner frames for thinking animation
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -544,7 +597,9 @@ def parse_agent_spec(agent_spec: str) -> Tuple[str, str]:
     return file_path, variable_name
 
 
-def load_graph(spec: str, default_graph_name: str = "graph"):
+def load_graph(
+    spec: str, default_graph_name: str = "graph", attach_default_checkpointer: bool = True
+):
     """
     Load a graph from either a file path or module path.
 
@@ -578,7 +633,11 @@ def load_graph(spec: str, default_graph_name: str = "graph"):
             graph_name = tail or default_graph_name
 
     graph = load_agent_spec(f"{path_or_module}:{graph_name}")
-    _ensure_checkpointer(graph)
+    # Skip the in-memory default when a durable per-workspace saver will be attached
+    # instead (session persistence, gh #102) — else build_agent's in-memory fallback
+    # would win and cross-invocation memory would be lost.
+    if attach_default_checkpointer:
+        _ensure_checkpointer(graph)
     return graph, graph_name
 
 
@@ -1170,6 +1229,14 @@ def cmd_status(args: str, context: Dict[str, Any]) -> Optional[str]:
     # so the value was reporting a distinction the runtime does not have (gh #88).
     print(f"  {DIM}Verbose:{RESET}     {'on' if verbose else 'off'}")
     print(f"  {DIM}CWD:{RESET}         {os.getcwd()}")
+    # Session persistence, when active (gh #102): so it's discoverable and honored-as-
+    # advertised (persistence on/off, durable store path).
+    session_info = config.get("_session_info")
+    if isinstance(session_info, dict) and session_info.get("persist"):
+        durable = session_info.get("durable")
+        print(f"  {DIM}Persist:{RESET}     on ({'durable' if durable else 'graph checkpointer'})")
+        if session_info.get("store"):
+            print(f"  {DIM}Store:{RESET}       {session_info['store']}")
     print()
     return None
 
@@ -1486,20 +1553,26 @@ async def run_single_turn_agui(
         if spinner:
             spinner.start()
         try:
-            async for chunk in agui_stream_updates(agent, message, thread_id, resume=resume):
-                if first_chunk:
-                    if spinner:
-                        spinner.stop()
-                    first_chunk = False
-                print_chunk(chunk, verbose=verbose)
-                if chunk.get("status") == "error":
-                    had_error = True
-                if chunk.get("status") == "interrupt":
-                    has_interrupt = True
-                    interrupt_data = chunk.get("interrupt", {})
-                    action_requests = interrupt_data.get("action_requests", [])
-                    num_pending_actions = len(action_requests) if action_requests else 1
-                    is_generic_interrupt = _is_generic_interrupt(action_requests)
+            # Silence ag_ui_langgraph's benign "failed to parse resume_input as JSON"
+            # WARNING that fires on a free-text interrupt() resume, so it never appears
+            # above the (correct) answer on the interactive HITL path. The filter is
+            # surgical — only that one record — so wrapping the whole turn is harmless
+            # (the warning can only fire on a resume pass anyway). (gh #103)
+            with _quiet_agui_resume_json_warning():
+                async for chunk in agui_stream_updates(agent, message, thread_id, resume=resume):
+                    if first_chunk:
+                        if spinner:
+                            spinner.stop()
+                        first_chunk = False
+                    print_chunk(chunk, verbose=verbose)
+                    if chunk.get("status") == "error":
+                        had_error = True
+                    if chunk.get("status") == "interrupt":
+                        has_interrupt = True
+                        interrupt_data = chunk.get("interrupt", {})
+                        action_requests = interrupt_data.get("action_requests", [])
+                        num_pending_actions = len(action_requests) if action_requests else 1
+                        is_generic_interrupt = _is_generic_interrupt(action_requests)
         finally:
             if spinner:
                 spinner.stop()
@@ -1533,6 +1606,40 @@ async def run_single_turn_agui(
     return time.time() - start_time, had_error
 
 
+async def _run_turn_persistent(
+    graph: Any,
+    sqlite_path: Path,
+    message: str,
+    thread_id: str,
+    interactive: bool,
+    verbose: bool,
+    *,
+    name: str,
+    session_config: Any,
+) -> tuple[float, bool]:
+    """Run ONE turn with a durable per-workspace SQLite checkpointer (gh #102).
+
+    The AG-UI streaming path is async-only, and langgraph's SYNC ``SqliteSaver`` raises
+    ``NotImplementedError`` for the async checkpointer methods the graph invokes — so the
+    durable saver here is the async-native ``AsyncSqliteSaver`` over the same SQLite file
+    (see the PR notes). Its aiosqlite connection is bound to the event loop it is opened
+    in and cannot cross loops, and the CLI runs each turn in its own ``asyncio.run``; so
+    the saver is opened and closed WITHIN this turn's loop, and the AG-UI agent is rebuilt
+    here so it wraps the graph with this turn's live checkpointer. Persistence is durable
+    regardless — the SQLite FILE is the store, keyed by ``thread_id`` — so reopening per
+    turn reads back every prior turn's state. The ``async with`` guarantees a clean
+    open/close even on Ctrl-C, so state is never corrupted.
+    """
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    from langstage_cli.agui_stream import build_session_agent
+
+    async with AsyncSqliteSaver.from_conn_string(str(sqlite_path)) as saver:
+        graph.checkpointer = saver
+        agent = build_session_agent(graph, name=name, config=session_config)
+        return await run_single_turn_agui(agent, message, thread_id, interactive, verbose)
+
+
 def run_conversation_loop(
     graph,
     config: Dict[str, Any],
@@ -1543,6 +1650,8 @@ def run_conversation_loop(
     stream_mode: str = "updates",
     initial_message: Optional[str] = None,
     single_shot: bool = False,
+    persist_sqlite_path: Optional[Path] = None,
+    on_turn: Optional[Any] = None,
 ):
     """
     Run a continuous conversation loop with the LangGraph agent.
@@ -1589,11 +1698,36 @@ def run_conversation_loop(
     configurable.pop("thread_id", None)
     session_config = {"configurable": configurable} if configurable else None
 
-    try:
-        agui_agent = build_session_agent(graph, name=agent_name, config=session_config)
-    except RuntimeError as e:
-        _status(f"{RED}⏺ {e}{RESET}")
-        return
+    # When persisting (gh #102) the durable AsyncSqliteSaver must be opened inside each
+    # turn's own event loop (its aiosqlite connection can't cross loops), so the agent is
+    # (re)built per turn there — skip the once-per-session build below. Otherwise build it
+    # once, as before, so the in-memory checkpointer's within-session memory persists.
+    agui_agent = None
+    if persist_sqlite_path is None:
+        try:
+            agui_agent = build_session_agent(graph, name=agent_name, config=session_config)
+        except RuntimeError as e:
+            _status(f"{RED}⏺ {e}{RESET}")
+            return
+
+    def run_one(msg: str) -> tuple:
+        """Run one turn, persisting to the durable store when configured."""
+        if on_turn is not None:
+            on_turn(msg)  # bump the session index (updated timestamp / first-message snippet)
+        if persist_sqlite_path is not None:
+            return asyncio.run(
+                _run_turn_persistent(
+                    graph,
+                    persist_sqlite_path,
+                    msg,
+                    thread_id,
+                    interactive,
+                    verbose,
+                    name=agent_name,
+                    session_config=session_config,
+                )
+            )
+        return asyncio.run(run_single_turn_agui(agui_agent, msg, thread_id, interactive, verbose))
 
     # Process initial message if provided
     if initial_message:
@@ -1602,9 +1736,7 @@ def run_conversation_loop(
             print(f"{initial_message}")
             print()
 
-        duration, had_error = asyncio.run(
-            run_single_turn_agui(agui_agent, initial_message, thread_id, interactive, verbose)
-        )
+        duration, had_error = run_one(initial_message)
         if _QUIET:
             # Only the reply reached stdout (streamed with end=""); cap it with a
             # single newline so the piped output ends cleanly. No timing line. (gh #53)
@@ -1692,9 +1824,7 @@ def run_conversation_loop(
                 print()  # Space before response
 
             # Run the agent (AG-UI is the only streaming path since langstage-core 1.0)
-            duration, _ = asyncio.run(
-                run_single_turn_agui(agui_agent, user_input, thread_id, interactive, verbose)
-            )
+            duration, _ = run_one(user_input)
             if _QUIET:
                 # Scriptable path (gh #93): cap the streamed reply with a single
                 # newline and emit no `Nms` timing line — exactly what the quiet
@@ -1714,6 +1844,114 @@ def run_conversation_loop(
     # path so a piped consumer never sees a trailing `Goodbye!`, gh #93).
     if not _QUIET:
         print_goodbye()
+
+
+# The README's stdlib StateGraph example — needs only langgraph (a base dependency),
+# so `langstage-cli init` scaffolds a graph that runs keyless with zero extra installs.
+# This is the BYO-graph analogue of --demo: a real, user-OWNED graph the adopter edits,
+# not a bundled runner. (gh #104)
+_INIT_AGENT_PY = """\
+# my_agent.py — a minimal LangGraph agent, runnable keyless (needs only langgraph,
+# a base dependency of langstage-cli). Edit `respond` to build your own agent, or
+# swap the node for a model call (see the langstage-cli README).
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import MessagesState
+from langchain_core.messages import AIMessage
+
+
+def respond(state):
+    last = state["messages"][-1].content
+    return {"messages": [AIMessage(content=f"You said: {last}")]}
+
+
+g = StateGraph(MessagesState)
+g.add_node("respond", respond)
+g.add_edge(START, "respond")
+g.add_edge("respond", END)
+graph = g.compile()
+"""
+
+_INIT_TOML = """\
+# Written by `langstage-cli init`. Points the CLI at your agent so a bare
+# `langstage-cli "Hello!"` runs it — no -a needed.
+[agent]
+spec = "my_agent.py:graph"
+"""
+
+_INIT_AGENT_FILENAME = "my_agent.py"
+_INIT_TOML_FILENAME = "langstage.toml"
+
+
+def scaffold_init(target_dir: Path, force: bool = False) -> int:
+    """Scaffold a runnable starter agent + ``langstage.toml`` into ``target_dir`` (gh #104).
+
+    Writes ``my_agent.py`` (the README's keyless stdlib example) and a ``langstage.toml``
+    wired to it, so the very next ``langstage-cli "Hello!"`` runs the user's OWN graph
+    with no ``-a`` and no hand-editing — the missing rung between ``--demo`` ("see it
+    work") and "run my own graph". Refuses to clobber an existing file unless ``force``
+    (never silently overwrites a user's agent), printing exactly what it did. Returns a
+    process exit code: 0 on success, 1 if it refused because a file already exists.
+    """
+    agent_path = target_dir / _INIT_AGENT_FILENAME
+    toml_path = target_dir / _INIT_TOML_FILENAME
+
+    if not force:
+        existing = [p.name for p in (agent_path, toml_path) if p.exists()]
+        if existing:
+            _status(f"{RED}⏺ Error: refusing to overwrite existing {', '.join(existing)}.{RESET}")
+            _status(f"{DIM}Re-run with --force to overwrite.{RESET}")
+            return 1
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    agent_path.write_text(_INIT_AGENT_PY, encoding="utf-8")
+    toml_path.write_text(_INIT_TOML, encoding="utf-8")
+
+    print(f"{GREEN}✓{RESET} Wrote {_INIT_AGENT_FILENAME} and {_INIT_TOML_FILENAME}")
+    print(f'{DIM}Next:{RESET}  langstage-cli "Hello!"        # runs your new agent')
+    print(f"{DIM}      langstage-cli --verify       # preflight it (one real turn){RESET}")
+    return 0
+
+
+def _resolve_persist(flag: Optional[bool], toml_config: dict) -> bool:
+    """Resolve whether to persist this session: ``--persist/--no-persist`` flag >
+    ``LANGSTAGE_PERSIST`` env > ``[session] persist`` TOML > default ON (gh #102).
+
+    Default-on is what makes ``--continue`` useful: a fresh run leaves a session behind
+    to resume. ``--continue`` / ``--resume`` force it on regardless (handled by caller).
+    """
+    if flag is not None:
+        return flag
+    env = os.getenv("LANGSTAGE_PERSIST")
+    if env is not None and env != "":
+        return env.strip().lower() in ("1", "true", "yes", "on")
+    toml_val = config_module.get(toml_config, "session.persist")
+    if isinstance(toml_val, bool):
+        return toml_val
+    return True
+
+
+def _format_ts(ts: Any) -> str:
+    """Format an epoch timestamp for the session list; ``?`` if unparseable."""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+    except (TypeError, ValueError):
+        return "?"
+
+
+def _print_sessions(workspace: Path) -> None:
+    """Print this workspace's persisted sessions, most-recent first (gh #102)."""
+    rows = sessions.list_sessions(workspace)
+    if not rows:
+        print(f"{DIM}No sessions yet for this workspace.{RESET}")
+        print(f'{DIM}Run a turn (e.g. langstage-cli "hi") to start one.{RESET}')
+        return
+    print(f"\n{BOLD}{BRIGHT_CYAN}Sessions{RESET} {DIM}({workspace}){RESET}")
+    print(f"{DIM}{'─' * 40}{RESET}")
+    for tid, entry in rows:
+        when = _format_ts(entry.get("updated"))
+        first = entry.get("first_message") or f"{DIM}(no message yet){RESET}"
+        print(f"  {CYAN}{tid[:8]}{RESET}  {DIM}{when}{RESET}  {first}")
+    print(f"\n{DIM}Resume with:  langstage-cli --resume <id>  (or -c for the most recent){RESET}\n")
 
 
 @click.command()
@@ -1812,6 +2050,44 @@ def run_conversation_loop(
     "completed cleanly, non-zero otherwise. Catches a missing key / broken tool "
     "/ bad graph before you rely on it (e.g. in CI).",
 )
+@click.option(
+    "--continue",
+    "-c",
+    "continue_session",
+    is_flag=True,
+    default=False,
+    help="Resume the MOST RECENT session for this workspace and keep the "
+    "conversation going (cross-invocation memory). Starts fresh if there is none.",
+)
+@click.option(
+    "--resume",
+    "resume_id",
+    is_flag=False,
+    flag_value=_RESUME_LIST_SENTINEL,
+    default=None,
+    help="Resume a specific session by id (as shown by --list-sessions). Bare "
+    "--resume lists recent sessions for this workspace to pick from.",
+)
+@click.option(
+    "--list-sessions",
+    "list_sessions",
+    is_flag=True,
+    default=False,
+    help="List recent persisted sessions for this workspace and exit.",
+)
+@click.option(
+    "--persist/--no-persist",
+    "persist",
+    default=None,
+    help="Persist this session to a durable store so it can be continued later "
+    "(default: on; also LANGSTAGE_PERSIST / [session] persist in langstage.toml).",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="For `init`: overwrite existing my_agent.py / langstage.toml (default: refuse).",
+)
 def main(
     message: Optional[str],
     agent_spec: Optional[str],
@@ -1826,6 +2102,11 @@ def main(
     show_config: bool,
     quiet: bool,
     verify_agent: bool,
+    continue_session: bool,
+    resume_id: Optional[str],
+    list_sessions: bool,
+    persist: Optional[bool],
+    force: bool,
 ):
     """
     Run a LangGraph agent from the command line.
@@ -1858,8 +2139,11 @@ def main(
         langstage-cli -a my_agent.py:graph
         langstage-cli -f ./prompt.md
         langstage-cli --demo "try it with no API key"
+        langstage-cli init                      # scaffold my_agent.py + langstage.toml
         langstage-cli --show-config
         langstage-cli --verify -a my_agent.py   # preflight one real turn; exit 0/1
+        langstage-cli "remember: I'm Kedar"     # persisted session
+        langstage-cli -c "what's my name?"      # continue the most recent session
     """
     # Windows consoles default to cp1252, where the spinner (Braille frames) and
     # status glyphs (✓ ⏺ —) raise UnicodeEncodeError — the documented
@@ -1889,6 +2173,18 @@ def main(
     )
     if _QUIET or not _is_tty:
         _disable_ansi()
+
+    # `langstage-cli init` — scaffold a runnable starter agent + langstage.toml, then
+    # exit. Handled here (before any agent/config resolution) because init needs
+    # neither: it just writes files into the current directory. (gh #104)
+    if message == "init":
+        sys.exit(scaffold_init(Path.cwd(), force=force))
+
+    # --continue and --resume are mutually exclusive — they name two different threads
+    # to resume, so passing both is a contradiction. (gh #102)
+    if continue_session and resume_id is not None:
+        _status(f"{RED}⏺ Error: --continue and --resume are mutually exclusive{RESET}")
+        sys.exit(1)
 
     if demo:
         if agent_spec:
@@ -2003,6 +2299,25 @@ def main(
         # cli chdirs into it only when it was, matching prior behavior.
         workspace_explicit = cfg.sources.get("workspace_root") != "default"
 
+        # ---- Session persistence (gh #102) ----
+        # The resolved workspace keys the per-workspace session store. Compute it from
+        # the same workspace_root the run uses (before apply_workspace's chdir, which
+        # fires only for an explicit root — so this is stable either way).
+        workspace = Path(cfg.workspace_root).expanduser().resolve()
+
+        # A bare --resume (or --list-sessions) just lists this workspace's sessions and
+        # exits — no agent needed.
+        if list_sessions or resume_id == _RESUME_LIST_SENTINEL:
+            _print_sessions(workspace)
+            return
+
+        # Persistence is on by default so a fresh run can be continued later; disable via
+        # --no-persist / LANGSTAGE_PERSIST=0 / [session] persist=false. --continue and
+        # --resume always imply it.
+        persist = _resolve_persist(persist, toml_config)
+        if continue_session or resume_id is not None:
+            persist = True
+
         # If no spec provided, try the default agent
         if not final_spec:
             default_agent_path = Path(__file__).parent.parent / "examples" / "agent.py"
@@ -2033,7 +2348,17 @@ def main(
         loading = None if _QUIET else Spinner("Loading agent")
         if loading:
             loading.start()
-        graph, final_graph_name = load_graph(final_spec, final_graph_name_default)
+        # Load WITHOUT the in-memory default so we can see whether the graph brought its
+        # OWN checkpointer. A user-supplied checkpointer always wins (same rule as the
+        # #38 in-memory default): we attach our durable per-workspace saver only when the
+        # graph has none AND persistence is on. Otherwise restore the #38 behavior below.
+        graph, final_graph_name = load_graph(
+            final_spec, final_graph_name_default, attach_default_checkpointer=False
+        )
+        had_user_checkpointer = getattr(graph, "checkpointer", None) is not None
+        use_durable = persist and not had_user_checkpointer
+        if not use_durable:
+            _ensure_checkpointer(graph)
         if loading:
             loading.stop()
             print(f"{GREEN}✓{RESET} {DIM}Loaded {final_spec}{RESET}")
@@ -2076,6 +2401,46 @@ def main(
             _snap_configurable if isinstance(_snap_configurable, dict) else None
         )
 
+        # ---- Resolve the session thread + wire up persistence (gh #102) ----
+        persist_sqlite_path: Optional[Path] = None
+        session_thread: Optional[str] = None
+        on_turn = None
+        if persist:
+            if continue_session:
+                session_thread = sessions.most_recent_thread(workspace)
+                if session_thread is None:
+                    _status(
+                        f"{DIM}⏺ No prior session for this workspace — starting a fresh one.{RESET}"
+                    )
+            elif resume_id is not None:
+                session_thread = sessions.resolve_thread(workspace, resume_id)
+                if session_thread is None:
+                    _status(
+                        f"{RED}⏺ Error: no session matching '{resume_id}' "
+                        f"for this workspace.{RESET}"
+                    )
+                    _status(f"{DIM}Run --list-sessions to see available sessions.{RESET}")
+                    sys.exit(1)
+            if session_thread is None:
+                # Fresh persisted session: honour a pinned [configurable] thread_id if the
+                # user set one (now it actually persists across runs — closing the "I
+                # pinned a thread and it still forgot" gap), else the fresh uuid above.
+                session_thread = config_dict["configurable"]["thread_id"]
+            config_dict["configurable"]["thread_id"] = session_thread
+            sessions.record_session(workspace, session_thread, first_message=message)
+            if use_durable:
+                persist_sqlite_path = sessions.db_path(workspace)
+
+            def on_turn(msg: str) -> None:  # bump index recency + first-message snippet
+                sessions.touch_session(workspace, session_thread, first_message=msg)
+
+            config_dict["_session_info"] = {
+                "persist": True,
+                "durable": use_durable,
+                "store": str(persist_sqlite_path) if persist_sqlite_path else None,
+                "thread": session_thread,
+            }
+
         # Extract agent name and description from graph object
         agent_name = get_agent_name(graph)
         agent_description = get_agent_description(graph)
@@ -2094,6 +2459,8 @@ def main(
             stream_mode=final_stream_mode,
             initial_message=message,
             single_shot=bool(message),
+            persist_sqlite_path=persist_sqlite_path,
+            on_turn=on_turn,
         )
         if turn_had_error:
             sys.exit(1)

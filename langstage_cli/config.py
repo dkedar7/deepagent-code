@@ -16,7 +16,12 @@ from pathlib import Path
 from typing import Any, ClassVar, List, Optional, Tuple
 
 from langstage_core.host import HostConfig, load_toml_config
-from langstage_core.host.config import _warn_legacy_env, _warned_legacy_env
+from langstage_core.host.config import (
+    _get_dotted,
+    _read_toml,
+    _warn_legacy_env,
+    _warned_legacy_env,
+)
 
 
 class ConfigError(Exception):
@@ -130,4 +135,44 @@ class CodeConfig(HostConfig):
             # signal a real user actually sees (the stderr note) would name a variable
             # absent from their environment, defeating the deprecation nudge (gh #73).
             _warned_legacy_env.add("DEEPAGENT_AGENT_SPEC")
-        return super().resolve(env=env, **kwargs)
+        obj = super().resolve(env=env, **kwargs)
+        _correct_toml_source_file_labels(obj)
+        return obj
+
+
+def _correct_toml_source_file_labels(cfg: HostConfig) -> None:
+    """Re-attribute each TOML-sourced value to the file it ACTUALLY came from (gh #101).
+
+    ``HostConfig.resolve`` stamps every ``toml``-sourced value with the LAST TOML
+    path it read (``toml_paths[-1]``) — which, when a global ``~/.langstage/config.toml``
+    and a project ``langstage.toml`` are both present and merged, is always the project
+    file. So a value set ONLY in the global config was mislabelled ``[toml (langstage.toml)]``,
+    sending a user debugging "where did ``workspace_root`` come from?" to the wrong file.
+    Merge/precedence were always correct; only the displayed source filename lied.
+
+    This walks the same files the resolver merged (global first, project last — project
+    wins on conflicts) and relabels each field's source with the highest-precedence file
+    that actually DEFINES its dotted key, so the source column names the real origin.
+    A cli-local fix: it post-processes the ``_sources`` map the shared resolver produced,
+    without touching core.
+    """
+    sources = getattr(cfg, "_sources", None)
+    toml_paths = getattr(cfg, "_toml_paths", None)
+    if not sources or not toml_paths:
+        return
+    toml_map = type(cfg)._toml_map()
+    # Read each merged file once; a value's winning file is the LAST (highest-precedence)
+    # one that defines its dotted key, mirroring the deep-merge's project-wins order.
+    per_file = [(path, _read_toml(path)) for path in toml_paths]
+    for name, origin in list(sources.items()):
+        if not origin.startswith("toml"):
+            continue
+        dotted = toml_map.get(name)
+        if dotted is None:
+            continue
+        winning: Optional[Path] = None
+        for path, data in per_file:
+            if _get_dotted(data, dotted) is not None:
+                winning = path
+        if winning is not None:
+            sources[name] = f"toml ({winning.name})"

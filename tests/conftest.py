@@ -45,3 +45,40 @@ def _reset_cli_global_state():
     _cli._QUIET = saved_quiet
     for name, value in saved_ansi.items():
         setattr(_cli, name, value)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_sessions(tmp_path, monkeypatch):
+    """Redirect session persistence (gh #102) to a per-test temp dir.
+
+    Persistence is ON by default, so ANY test that runs a real turn through ``main()``
+    would otherwise write a session store under the real ``~/.langstage/sessions``.
+    Pointing ``LANGSTAGE_CLI_SESSIONS_DIR`` at a temp dir keeps the whole suite hermetic
+    and off the developer's home — without touching config resolution (it's a dedicated
+    env var, distinct from ``LANGSTAGE_CONFIG_HOME``).
+    """
+    monkeypatch.setenv("LANGSTAGE_CLI_SESSIONS_DIR", str(tmp_path / "_sessions"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_published_workspace():
+    """Undo ``apply_workspace``'s env publishing between tests.
+
+    ``apply_workspace`` (ADR 0005) exports the resolved workspace as
+    ``LANGSTAGE_WORKSPACE_ROOT`` / ``DEEPAGENT_WORKSPACE_ROOT`` in ``os.environ`` — a
+    real product behavior, but it bypasses monkeypatch, so a test that runs a turn leaks
+    a workspace path (often a since-deleted temp dir) into the next test, corrupting its
+    config resolution / chdir. Snapshot and restore those two vars around every test.
+    """
+    import os
+
+    names = ("LANGSTAGE_WORKSPACE_ROOT", "DEEPAGENT_WORKSPACE_ROOT")
+    saved = {name: os.environ.get(name) for name in names}
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
