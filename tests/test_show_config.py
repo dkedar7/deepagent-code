@@ -127,3 +127,53 @@ def test_show_config_title_env_not_advertised_as_effective():
     assert r.exit_code == 0, r.output
     assert "MyCoolAgent" not in r.output
     assert not re.search(r"^\s*title\s*=", r.output, re.MULTILINE)
+
+
+def test_show_config_attributes_deepagent_spec_to_the_var_actually_set():
+    """gh #107: a value set via the oldest legacy alias DEEPAGENT_SPEC must be attributed
+    to DEEPAGENT_SPEC — the var the user actually set — not to DEEPAGENT_AGENT_SPEC, the
+    canonical-legacy key the resolver copies it onto (a var absent from the environment,
+    contradicting --show-config's own stderr deprecation note)."""
+    with CliRunner().isolated_filesystem():  # no stray toml / other spec vars
+        r = CliRunner().invoke(main, ["--show-config"], env={"DEEPAGENT_SPEC": "my_agent.py:graph"})
+    assert r.exit_code == 0, r.output
+    # The [source] column names the var the user set...
+    assert re.search(r"agent_spec\s*=\s*my_agent\.py:graph\s*\[env:DEEPAGENT_SPEC\]", r.output), (
+        r.output
+    )
+    # ...and never the injected canonical-legacy key that was never in the environment.
+    assert "[env:DEEPAGENT_AGENT_SPEC]" not in r.output, r.output
+
+
+def test_show_config_surfaces_session_persistence_on(tmp_path, monkeypatch):
+    """gh #108: --show-config (the scriptable inspector) must surface the persist/session
+    config the way interactive /status does — persistence on/off, its source, store path —
+    finishing #102 item 3. Default config: persistence ON."""
+    monkeypatch.chdir(tmp_path)
+    r = CliRunner().invoke(main, ["--show-config"])
+    assert r.exit_code == 0, r.output
+    assert "Session persistence:" in r.output, r.output
+    assert re.search(r"persist\s*=\s*True\s*\[default\]", r.output), r.output
+    # the source hint, matching describe()'s style
+    assert "(env: LANGSTAGE_PERSIST, toml: session.persist)" in r.output, r.output
+    # the store path is shown when persistence is on
+    assert re.search(r"sessions_store\s*=\s*\S+\.sqlite", r.output), r.output
+
+
+def test_show_config_surfaces_persist_off_so_the_off_switch_is_verifiable(tmp_path, monkeypatch):
+    """gh #108: --no-persist must be visible in --show-config so "did my off-switch work?"
+    is answerable from the scriptable surface (it isn't from /status, which only prints
+    Persist: when persistence is ON)."""
+    monkeypatch.chdir(tmp_path)
+    r = CliRunner().invoke(main, ["--no-persist", "--show-config"])
+    assert r.exit_code == 0, r.output
+    assert re.search(r"persist\s*=\s*False\s*\[override\]", r.output), r.output
+
+
+def test_show_config_persist_source_is_the_toml_key_when_set_there(tmp_path, monkeypatch):
+    """gh #108: [session] persist in langstage.toml is attributed to the TOML key."""
+    (tmp_path / "langstage.toml").write_text("[session]\npersist = false\n")
+    monkeypatch.chdir(tmp_path)
+    r = CliRunner().invoke(main, ["--show-config"])
+    assert r.exit_code == 0, r.output
+    assert re.search(r"persist\s*=\s*False\s*\[toml \(session\.persist\)\]", r.output), r.output

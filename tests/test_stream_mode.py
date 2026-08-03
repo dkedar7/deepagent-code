@@ -48,7 +48,9 @@ def test_stream_mode_is_omitted_from_show_config():
     # gh #62: the deprecated no-op knob is no longer advertised in --show-config.
     r = CliRunner().invoke(main, ["--show-config"])
     assert r.exit_code == 0, r.output
-    assert "stream_mode" not in r.output
+    # Assert the KEY is not a rendered config line (a bare substring check trips on the
+    # sessions_store path, which under pytest embeds this test's name — gh #108).
+    assert not any(ln.strip().startswith("stream_mode") for ln in r.output.splitlines()), r.output
 
 
 def test_stream_mode_flag_is_accepted_and_ignored_with_a_notice():

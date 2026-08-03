@@ -117,6 +117,7 @@ class CodeConfig(HostConfig):
         # Reconcile the oldest legacy spec var. DEEPAGENT_AGENT_SPEC itself is
         # the shared resolver's legacy twin of LANGSTAGE_AGENT_SPEC, so mapping
         # onto it keeps the full precedence chain intact.
+        used_oldest_spec_alias = False
         if (
             not env.get("LANGSTAGE_AGENT_SPEC")
             and not env.get("DEEPAGENT_AGENT_SPEC")
@@ -135,7 +136,22 @@ class CodeConfig(HostConfig):
             # signal a real user actually sees (the stderr note) would name a variable
             # absent from their environment, defeating the deprecation nudge (gh #73).
             _warned_legacy_env.add("DEEPAGENT_AGENT_SPEC")
+            used_oldest_spec_alias = True
         obj = super().resolve(env=env, **kwargs)
+        # The shared resolver read the value out of the injected DEEPAGENT_AGENT_SPEC key
+        # and stamped its source `env:DEEPAGENT_AGENT_SPEC` — but the user only ever set
+        # DEEPAGENT_SPEC, so `--show-config` named a var absent from the environment
+        # (contradicting its own stderr note). Re-attribute the provenance to the alias
+        # that actually supplied the value, mirroring what `_warn_legacy_env` already
+        # does for the note (gh #107). Same source-accuracy fix as #101 (TOML files) and
+        # #20 (CLI flags), for the env-var alias path.
+        if used_oldest_spec_alias:
+            sources = getattr(obj, "_sources", None)
+            if (
+                isinstance(sources, dict)
+                and sources.get("agent_spec") == "env:DEEPAGENT_AGENT_SPEC"
+            ):
+                sources["agent_spec"] = "env:DEEPAGENT_SPEC"
         _correct_toml_source_file_labels(obj)
         return obj
 
