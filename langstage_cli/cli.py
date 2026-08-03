@@ -105,6 +105,21 @@ def _status(msg: str) -> None:
     print(msg, file=sys.stderr if _QUIET else sys.stdout)
 
 
+def _fmt_exc(e: BaseException) -> str:
+    """Render an exception for a top-level ``Error:`` line, naming the class.
+
+    Many "my agent doesn't load yet" exceptions have an EMPTY ``str(e)`` — a bare
+    ``assert x`` (``AssertionError('')``), ``raise NotImplementedError``,
+    ``raise RuntimeError()`` — so a handler that prints only ``{e}`` collapsed to a
+    blank, typeless ``Error:`` with nothing to act on (gh #109). Fall back to the
+    class name when the message is empty, and prefix it otherwise, so the load/top-
+    level path names the type just like the runtime turn-error path (which core
+    renders as ``{type(exc).__name__}: {exc}``).
+    """
+    msg = str(e)
+    return f"{type(e).__name__}: {msg}" if msg else type(e).__name__
+
+
 # Keys the terminal CLI never honors, so `--show-config` / `/config` omit them and
 # the diagnostic only advertises knobs that actually do something. The inherited
 # HostConfig server keys — it starts no server (host/port/debug are inert) and the
@@ -1262,6 +1277,10 @@ def _live_resolved_report(config: Dict[str, Any], context: Dict[str, Any]) -> st
     ``/status`` and ``/config <key>``. Falls back to the frozen snapshot string only
     when the resolved cfg is unavailable (e.g. a hand-built test context).
     """
+    # The session-persistence block (gh #108), computed at startup, appended to every
+    # rendering so /config surfaces persistence exactly as --show-config does.
+    persist_block = config.get("_persist_diagnostic")
+
     resolved_cfg = config.get("_resolved_config")
     if resolved_cfg is None:
         # No live cfg to render from: honour the startup snapshot as-is, and only
@@ -1273,6 +1292,8 @@ def _live_resolved_report(config: Dict[str, Any], context: Dict[str, Any]) -> st
             report = CodeConfig.resolve().describe(
                 omit_keys=_INERT_KEYS, configurable=config.get("configurable") or None
             )
+        if persist_block:
+            report += "\n" + persist_block
         return report
 
     # Overlay the one runtime-mutable field (verbose) onto a copy, keeping every static
@@ -1295,7 +1316,10 @@ def _live_resolved_report(config: Dict[str, Any], context: Dict[str, Any]) -> st
     if isinstance(snap_conf, dict) and snap_conf:
         overlaid = {k: live_conf.get(k, v) for k, v in snap_conf.items()}
 
-    return live_cfg.describe(omit_keys=_INERT_KEYS, configurable=overlaid)
+    report = live_cfg.describe(omit_keys=_INERT_KEYS, configurable=overlaid)
+    if persist_block:
+        report += "\n" + persist_block
+    return report
 
 
 @register_command(
@@ -1354,6 +1378,25 @@ def cmd_config(args: str, context: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+async def _aget_state_via_durable_saver(graph: Any, store_path: str, config: Dict[str, Any]) -> Any:
+    """Read graph state through the ASYNC checkpointer API on a freshly-opened saver.
+
+    In the shipped persist-on default (gh #102) the durable checkpointer is an
+    ``AsyncSqliteSaver`` opened INSIDE each turn's own event loop and closed when the turn
+    ends (its aiosqlite connection can't cross loops) — so by the time ``/history`` runs
+    there is no live saver. A SYNC ``graph.get_state()`` against that async-only, already-
+    closed saver schedules ``aget_tuple()`` as a never-awaited coroutine and surfaces
+    ``Event loop is closed`` plus a ``RuntimeWarning`` (gh #106). Mirror
+    ``_run_turn_persistent``: open a fresh saver over the SAME SQLite file in THIS loop and
+    read through the async API, so ``/history`` renders on a normal persist-on run.
+    """
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    async with AsyncSqliteSaver.from_conn_string(store_path) as saver:
+        graph.checkpointer = saver
+        return await graph.aget_state(config)
+
+
 @register_command(
     name="history",
     description="Show recent messages (if available)",
@@ -1368,46 +1411,62 @@ def cmd_history(args: str, context: Dict[str, Any]) -> Optional[str]:
         print(f"{YELLOW}No graph available{RESET}")
         return None
 
+    # The durable per-workspace store (gh #102), when persistence is on: read history
+    # through the async saver on its own loop (gh #106) instead of the sync get_state,
+    # which can't drive the closed AsyncSqliteSaver.
+    session_info = config.get("_session_info") if isinstance(config, dict) else None
+    store_path = (
+        session_info.get("store")
+        if isinstance(session_info, dict) and session_info.get("persist")
+        else None
+    )
+
     try:
-        # Try to get state from the graph's checkpointer
-        if hasattr(graph, "get_state"):
+        # Prefer the async read on the durable store; otherwise the sync path still works
+        # (an in-memory checkpointer, e.g. --no-persist, drives get_state fine).
+        state = None
+        if store_path:
+            state = asyncio.run(_aget_state_via_durable_saver(graph, store_path, config))
+        elif hasattr(graph, "get_state"):
             state = graph.get_state(config)
-            if state and hasattr(state, "values"):
-                messages = state.values.get("messages", [])
-                if messages:
-                    print(f"\n{BOLD}{BRIGHT_CYAN}Conversation History{RESET}")
-                    print(f"{DIM}{'─' * 40}{RESET}")
-
-                    # Show last N messages
-                    limit = 10
-                    if args:
-                        try:
-                            limit = int(args)
-                        except ValueError:
-                            pass
-
-                    for msg in messages[-limit:]:
-                        role = getattr(msg, "type", "unknown")
-                        content = getattr(msg, "content", str(msg))
-
-                        if role == "human":
-                            print(f"\n  {BRIGHT_BLUE}You:{RESET}")
-                        elif role == "ai":
-                            print(f"\n  {BRIGHT_CYAN}Agent:{RESET}")
-                        else:
-                            print(f"\n  {DIM}{role}:{RESET}")
-
-                        # Truncate long content
-                        if len(content) > 200:
-                            content = content[:200] + "..."
-                        print(f"  {DIM}{content}{RESET}")
-                    print()
-                else:
-                    print(f"{DIM}No messages in history{RESET}")
-            else:
-                print(f"{DIM}No state available{RESET}")
         else:
             print(f"{DIM}Graph does not support state retrieval{RESET}")
+            return None
+
+        if state and hasattr(state, "values"):
+            messages = state.values.get("messages", [])
+            if messages:
+                print(f"\n{BOLD}{BRIGHT_CYAN}Conversation History{RESET}")
+                print(f"{DIM}{'─' * 40}{RESET}")
+
+                # Show last N messages
+                limit = 10
+                if args:
+                    try:
+                        limit = int(args)
+                    except ValueError:
+                        pass
+
+                for msg in messages[-limit:]:
+                    role = getattr(msg, "type", "unknown")
+                    content = getattr(msg, "content", str(msg))
+
+                    if role == "human":
+                        print(f"\n  {BRIGHT_BLUE}You:{RESET}")
+                    elif role == "ai":
+                        print(f"\n  {BRIGHT_CYAN}Agent:{RESET}")
+                    else:
+                        print(f"\n  {DIM}{role}:{RESET}")
+
+                    # Truncate long content
+                    if len(content) > 200:
+                        content = content[:200] + "..."
+                    print(f"  {DIM}{content}{RESET}")
+                print()
+            else:
+                print(f"{DIM}No messages in history{RESET}")
+        else:
+            print(f"{DIM}No state available{RESET}")
     except Exception as e:
         print(f"{DIM}Could not retrieve history: {e}{RESET}")
 
@@ -1930,6 +1989,61 @@ def _resolve_persist(flag: Optional[bool], toml_config: dict) -> bool:
     return True
 
 
+def _persist_source_label(flag: Optional[bool], toml_config: dict) -> str:
+    """The ``[source]`` for the resolved persist value — mirrors ``_resolve_persist``'s
+    chain (``--persist/--no-persist`` > ``LANGSTAGE_PERSIST`` > ``[session] persist`` >
+    default) so ``--show-config`` attributes it just like every other key (gh #108)."""
+    if flag is not None:
+        return "override"
+    env = os.getenv("LANGSTAGE_PERSIST")
+    if env is not None and env != "":
+        return "env:LANGSTAGE_PERSIST"
+    if isinstance(config_module.get(toml_config, "session.persist"), bool):
+        return "toml (session.persist)"
+    return "default"
+
+
+def _sessions_store_source_label() -> str:
+    """The ``[source]`` for the sessions store directory (gh #108)."""
+    if os.getenv(sessions._SESSIONS_DIR_ENV):
+        return f"env:{sessions._SESSIONS_DIR_ENV}"
+    if os.getenv("LANGSTAGE_CONFIG_HOME"):
+        return "env:LANGSTAGE_CONFIG_HOME"
+    if os.getenv("DEEPAGENTS_CONFIG_HOME"):
+        return "env:DEEPAGENTS_CONFIG_HOME"
+    return "default"
+
+
+def _persist_diagnostic_block(flag: Optional[bool], toml_config: dict, workspace: Path) -> str:
+    """Render the session-persistence block appended to the config diagnostic (gh #108).
+
+    Session persistence is a headline feature (``--continue``/``--resume``, on by
+    default) with a full resolution chain, yet only interactive ``/status`` surfaced it —
+    the scriptable ``--show-config`` never did, so #102's item 3 (surface it in BOTH) was
+    half-done. ``persist`` isn't a ``CodeConfig`` field (it's resolved out-of-band by
+    ``_resolve_persist``), so it can't flow through core's ``describe()``; this renders it
+    in the SAME style right after it, and both ``--show-config`` and interactive
+    ``/config`` append this one block so the two can't disagree. The store path is
+    computed WITHOUT creating the directory (a read-only diagnostic must have no side
+    effects).
+    """
+    persist_val = _resolve_persist(flag, toml_config)
+    source = _persist_source_label(flag, toml_config)
+    lines = ["", "  Session persistence:"]
+    lines.append(
+        f"  {'persist':<16} = {str(persist_val):<26} [{source}]"
+        "   (env: LANGSTAGE_PERSIST, toml: session.persist)"
+    )
+    if persist_val:
+        # sessions_dir() reads env only (no mkdir); build the path by hand so the
+        # diagnostic never touches the filesystem the way db_path() would.
+        store = sessions.sessions_dir() / f"{sessions.workspace_key(workspace)}.sqlite"
+        lines.append(
+            f"  {'sessions_store':<16} = {str(store):<26} [{_sessions_store_source_label()}]"
+        )
+    return "\n".join(lines)
+
+
 def _format_ts(ts: Any) -> str:
     """Format an epoch timestamp for the session list; ``?`` if unparseable."""
     try:
@@ -2236,14 +2350,17 @@ def main(
         # describe() renderer, so --show-config and /config can't disagree by construction.
         _toml, _ = config_module.load_config()
         _configurable = config_module.get(_toml, "configurable")
-        print(
-            config_module.CodeConfig.resolve(
-                toml_start=Path.cwd(), overrides=cli_overrides
-            ).describe(
-                omit_keys=_INERT_KEYS,
-                configurable=_configurable if isinstance(_configurable, dict) else None,
-            )
+        _cfg = config_module.CodeConfig.resolve(toml_start=Path.cwd(), overrides=cli_overrides)
+        _diag = _cfg.describe(
+            omit_keys=_INERT_KEYS,
+            configurable=_configurable if isinstance(_configurable, dict) else None,
         )
+        # Session persistence isn't a CodeConfig field, so append it here (gh #108) — the
+        # interactive /config appends the identical block, keeping the two in lock-step.
+        _diag += "\n" + _persist_diagnostic_block(
+            persist, _toml, Path(_cfg.workspace_root).expanduser().resolve()
+        )
+        print(_diag)
         return
 
     try:
@@ -2314,6 +2431,7 @@ def main(
         # Persistence is on by default so a fresh run can be continued later; disable via
         # --no-persist / LANGSTAGE_PERSIST=0 / [session] persist=false. --continue and
         # --resume always imply it.
+        persist_flag = persist  # raw --persist/--no-persist (None if unset), for the diagnostic
         persist = _resolve_persist(persist, toml_config)
         if continue_session or resume_id is not None:
             persist = True
@@ -2400,6 +2518,12 @@ def main(
         config_dict["_snap_configurable"] = (
             _snap_configurable if isinstance(_snap_configurable, dict) else None
         )
+        # The session-persistence block interactive /config appends to the diagnostic —
+        # computed from the SAME (flag, toml, workspace) as --show-config so the two agree
+        # byte-for-byte (gh #108). Uses the raw flag (pre-forcing) to match --show-config.
+        config_dict["_persist_diagnostic"] = _persist_diagnostic_block(
+            persist_flag, toml_config, workspace
+        )
 
         # ---- Resolve the session thread + wire up persistence (gh #102) ----
         persist_sqlite_path: Optional[Path] = None
@@ -2481,21 +2605,27 @@ def main(
             pass
         sys.exit(0)
     except FileNotFoundError as e:
-        _status(f"{RED}⏺ Error: {e}{RESET}")
+        _status(f"{RED}⏺ Error: {_fmt_exc(e)}{RESET}")
         sys.exit(1)
     except AttributeError as e:
-        _status(f"{RED}⏺ Error: {e}{RESET}")
+        _status(f"{RED}⏺ Error: {_fmt_exc(e)}{RESET}")
         sys.exit(1)
     except ModuleNotFoundError as e:
-        _status(f"{RED}⏺ Error: {e}{RESET}")
+        _status(f"{RED}⏺ Error: {_fmt_exc(e)}{RESET}")
         _status(f"\n{DIM}Make sure your agent's dependencies are installed.{RESET}")
         sys.exit(1)
     except Exception as e:
-        _status(f"{RED}⏺ Error: {e}{RESET}")
+        # Name the exception class (gh #109): an empty str(e) — a bare `assert`, a
+        # `raise NotImplementedError`, `RuntimeError()` — otherwise collapsed this to a
+        # blank, typeless `Error:`. Always point at -v for the traceback, like the
+        # runtime turn-error path, so a stuck user gets something to act on.
+        _status(f"{RED}⏺ Error: {_fmt_exc(e)}{RESET}")
         if verbose:
             import traceback
 
             _status(traceback.format_exc())
+        else:
+            _status(f"{DIM}Re-run with -v for the full traceback.{RESET}")
         sys.exit(1)
 
 

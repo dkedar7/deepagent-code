@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.6.28 - 2026-08-03
+
+### Fixed
+- **`/history` no longer errors in the default persist-on config (gh #106).** Since
+  persistence went on by default (#102), the durable checkpointer is the async-only
+  `AsyncSqliteSaver`, opened inside each turn's own event loop and closed when the turn
+  ends. `/history` still read state via the **sync** `graph.get_state`, which against that
+  async, already-closed saver scheduled `aget_tuple` as a never-awaited coroutine and
+  surfaced `Could not retrieve history: Event loop is closed` plus a `RuntimeWarning` —
+  every user hit it on a normal run (it only worked under `--no-persist`). `/history` now
+  reads through the async API on a freshly-opened saver over the same SQLite file (mirroring
+  the run loop), so it renders the conversation on a persist-on run; the sync path still
+  serves the in-memory (`--no-persist`) case.
+- **`--show-config` names the env var you actually set for `DEEPAGENT_SPEC` (gh #107).** A
+  value supplied through the oldest legacy alias `DEEPAGENT_SPEC` was labelled
+  `[env:DEEPAGENT_AGENT_SPEC]` — the canonical-legacy key the resolver copies it onto, a
+  var absent from the environment — contradicting the command's own stderr deprecation note.
+  The `[source]` column now reports `[env:DEEPAGENT_SPEC]`, matching the note and the
+  source-accuracy fixes already done for TOML files (#101) and CLI flags (#20).
+- **A load/top-level exception with an empty message is no longer a blank, typeless
+  `Error:` (gh #109).** A bare `assert`, `raise NotImplementedError`, or `RuntimeError()`
+  has an empty `str(e)`, so the top-level handlers printed just `Error:` — no class, no
+  hint. They now name the exception class (`Error: NotImplementedError`) and point at `-v`
+  for the traceback, matching the runtime turn-error path.
+
+### Added
+- **`--show-config` surfaces the session/persistence config (gh #108, finishes #102 item
+  3).** Persistence — a headline feature, on by default with a full
+  `--persist/--no-persist` > `LANGSTAGE_PERSIST` > `[session] persist` > default chain —
+  was visible only in interactive `/status`, never in the scriptable `--show-config`.
+  `--show-config` now shows the resolved `persist` value with its `[source]`, the
+  `(env: LANGSTAGE_PERSIST, toml: session.persist)` hint, and the store path when on (in
+  both on and off states, so the off-switch is verifiable). Interactive `/config` appends
+  the identical block, so the two diagnostics can't disagree.
+
 ## 0.6.27 - 2026-07-31
 
 ### Added

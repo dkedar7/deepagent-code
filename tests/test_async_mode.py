@@ -64,7 +64,9 @@ def test_async_mode_is_omitted_from_show_config():
     with CliRunner().isolated_filesystem():  # no stray toml
         r = CliRunner().invoke(main, ["--show-config"])
     assert r.exit_code == 0, r.output
-    assert "async_mode" not in r.output
+    # Assert the KEY is not a rendered config line (a bare substring check trips on the
+    # sessions_store path, which under pytest embeds this test's name — gh #108).
+    assert not any(ln.strip().startswith("async_mode") for ln in r.output.splitlines()), r.output
 
 
 def test_async_mode_flag_does_not_reappear_in_show_config_as_an_override():
