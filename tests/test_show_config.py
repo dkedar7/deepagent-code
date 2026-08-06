@@ -177,3 +177,33 @@ def test_show_config_persist_source_is_the_toml_key_when_set_there(tmp_path, mon
     r = CliRunner().invoke(main, ["--show-config"])
     assert r.exit_code == 0, r.output
     assert re.search(r"persist\s*=\s*False\s*\[toml \(session\.persist\)\]", r.output), r.output
+
+
+def test_show_config_does_not_flag_documented_session_persist_as_unknown(tmp_path, monkeypatch):
+    """gh #112: [session] persist is a documented, honored key, so --show-config must NOT
+    list it under "unknown TOML keys" — in the exact output that attributes persist to it.
+
+    Regression for the post-#108 gap: core's unknown_toml_keys() flagged session.persist
+    because it isn't a CodeConfig dataclass field (persist is resolved out-of-band). The fix
+    registers session.persist in CodeConfig._TOML's known set so it stops being false-flagged,
+    while genuine typos stay flagged (asserted below)."""
+    (tmp_path / "langstage.toml").write_text("[session]\npersist = true\n")
+    monkeypatch.chdir(tmp_path)
+    r = CliRunner().invoke(main, ["--show-config"])
+    assert r.exit_code == 0, r.output
+    # The documented key must NOT be reported as unknown...
+    assert "unknown TOML keys" not in r.output, r.output
+    assert "session.persist" not in r.output.split("Session persistence:")[0], r.output
+    # ...yet it is still honored and attributed to its TOML source (the two lines agree now).
+    assert re.search(r"persist\s*=\s*True\s*\[toml \(session\.persist\)\]", r.output), r.output
+
+
+def test_show_config_still_flags_a_typod_session_key_as_unknown(tmp_path, monkeypatch):
+    """gh #112: the fix must NOT disable the unknown-key detector — a typo'd key under the
+    same [session] table (perssist) and a bogus table must still be surfaced as unknown."""
+    (tmp_path / "langstage.toml").write_text("[session]\nperssist = true\n[bogus]\nx = 1\n")
+    monkeypatch.chdir(tmp_path)
+    r = CliRunner().invoke(main, ["--show-config"])
+    assert r.exit_code == 0, r.output
+    assert re.search(r"unknown TOML keys.*session\.perssist", r.output), r.output
+    assert re.search(r"unknown TOML keys.*bogus\.x", r.output), r.output

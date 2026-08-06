@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.29 - 2026-08-06
+
+### Fixed
+- **`--show-config` no longer flags the documented `[session] persist` key as an "unknown
+  TOML key" (gh #112).** `langstage-core` 1.0.32 added unknown-TOML-key detection
+  (`HostConfig.unknown_toml_keys()`, surfaced in `--show-config`), which flags any TOML key
+  that maps to no config field. `persist` is resolved out-of-band by `_resolve_persist`
+  (flag > `LANGSTAGE_PERSIST` > `[session] persist` > default-on), so it isn't a `CodeConfig`
+  dataclass field — and the detector wrongly listed the documented, honored `session.persist`
+  under "unknown TOML keys (ignored - a typo or wrong table?)", in the very same output that
+  attributed `persist = ... [toml (session.persist)]` to it. `CodeConfig._TOML` now registers
+  `session.persist` in the known-key set so it stops being false-flagged. It's a map entry,
+  not a field, so `persist` stays resolved out-of-band and rendered by its own block (no
+  double-render). A genuine typo like `[session] perssist` (or any unknown table) is still
+  flagged — the detector isn't disabled, only the false positive is removed.
+
 ## 0.6.28 - 2026-08-03
 
 ### Fixed
