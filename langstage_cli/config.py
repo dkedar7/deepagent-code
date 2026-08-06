@@ -109,6 +109,18 @@ class CodeConfig(HostConfig):
     _TOML: ClassVar[dict] = {
         "graph_name": "agent.graph_name",
         "verbose": "ui.verbose",
+        # session.persist has no CodeConfig FIELD — persist is resolved out-of-band by
+        # cli._resolve_persist (flag > LANGSTAGE_PERSIST > [session] persist > default-on)
+        # and rendered by its own --show-config block (gh #102/#108). But core's
+        # unknown_toml_keys() flags any TOML key absent from _toml_map(), so post-#108
+        # --show-config wrongly listed the documented, honored [session] persist under
+        # "unknown TOML keys" — in the same output that attributes persist to it (gh #112).
+        # Registering the dotted key here adds it to the KNOWN set so it's no longer flagged.
+        # It's a map entry, not a field: resolve()/describe()/config_dict() iterate dataclass
+        # fields, so this neither creates a phantom field nor double-renders persist — while a
+        # typo like [session] perssist (absent from the map, not a passthrough) is still flagged.
+        # A [session] passthrough would instead silence the WHOLE table, hiding real typos.
+        "persist": "session.persist",
     }
 
     @classmethod
