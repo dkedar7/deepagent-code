@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.6.30 - 2026-08-08
+
+### Fixed
+- **A relative `agent.spec` in `langstage.toml` now resolves against the toml's own
+  directory, so an `init`-scaffolded project runs from any subdirectory (gh #116).**
+  Config discovery walks UP ancestor dirs to find `langstage.toml` (a project-root
+  concept, so you can run the CLI from anywhere in your project), but a relative
+  `agent.spec` in it — exactly what `init` scaffolds (`spec = "my_agent.py:graph"`) —
+  was resolved against the process **cwd**. So the moment you ran from a subdirectory the
+  spec was looked up under that subdir and crashed `Agent file not found`, even though
+  `--show-config` (walking up correctly) reported the spec resolved. A relative spec that
+  came from a discovered `langstage.toml` now rebases onto **that toml's directory** (the
+  project root) before loading — the same way a path in `pyproject.toml` / `tsconfig.json`
+  resolves relative to the config file — so the project runs identically from its root and
+  any subdirectory. A spec from `-a` / `LANGSTAGE_AGENT_SPEC` keeps its cwd-relative base
+  ("the file is where the user typed the command", gh #30); only toml-sourced relative
+  specs change base. The `path:attr` split stays Windows drive-letter safe (`C:\x.py:graph`).
+- **A wrong-type agent object now shows `build_agent`'s clean `TypeError` on the default
+  persist-on run path, not a cryptic `AttributeError: 'X' object has no attribute
+  'checkpointer'` (gh #117).** When the resolved agent isn't a compiled graph (`graph =
+  None`, a dict, an int — a placeholder, a construction that fell through, or `-a` pointed
+  at the wrong attribute), the default path attaches the durable `AsyncSqliteSaver` (#102)
+  by setting `graph.checkpointer` **before** `build_agent` validates the graph — so the
+  attribute-set raised first and leaked an internal `AttributeError`. `--verify` and
+  `--no-persist` already reached `build_agent`'s actionable `TypeError: build_agent expected
+  a compiled LangGraph graph (CompiledStateGraph) ... but got NoneType.`; the default config
+  (which every user hits) now does too. The durable saver assignment is guarded exactly like
+  the non-durable `_ensure_checkpointer`, so a valid graph is unaffected and the wrong-type
+  object falls through to the one clean validator message.
+
 ## 0.6.29 - 2026-08-06
 
 ### Fixed
