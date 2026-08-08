@@ -678,6 +678,30 @@ def _ensure_checkpointer(graph: Any) -> None:
         pass
 
 
+def _split_py_file_spec(spec: str) -> Optional[Tuple[str, str]]:
+    """Split a ``path.py[:attr]`` agent spec into ``(file_path, suffix)`` when the
+    path part is a ``.py`` FILE path; return ``None`` for module specs / non-specs.
+
+    ``suffix`` is the reattachable ``":attr"`` (or ``""`` for a bare path). The
+    ``path:attr`` split is the same one ``load_graph`` uses and stays Windows
+    drive-letter safe: a trailing ``':token'`` is a graph-name suffix only when it
+    has no path separator, so ``C:\\x.py:graph`` keeps its drive colon and splits at
+    the final ``:graph``. Shared by ``_absolutize_file_spec`` (cwd base, gh #30) and
+    ``_rebase_toml_file_spec`` (toml-dir base, gh #116) so the parse lives in one place.
+    """
+    if not spec:
+        return None
+    path_part, suffix = spec, ""
+    if ":" in spec:
+        head, _, tail = spec.rpartition(":")
+        if tail and "/" not in tail and "\\" not in tail:
+            path_part, suffix = head, f":{tail}"
+    # Only a .py file path is a resolvable file; a module path (pkg.mod) is not.
+    if not path_part.endswith(".py"):
+        return None
+    return path_part, suffix
+
+
 def _absolutize_file_spec(spec: str) -> str:
     """Resolve a relative *file-path* agent spec to an absolute path against the
     current cwd.
@@ -689,19 +713,37 @@ def _absolutize_file_spec(spec: str) -> str:
     the invocation cwd. Module specs (``pkg.mod:attr``) and already-absolute
     paths pass through unchanged. (gh #30)
     """
-    if not spec:
+    parsed = _split_py_file_spec(spec)
+    if parsed is None:
         return spec
-    path_part, suffix = spec, ""
-    if ":" in spec:
-        head, _, tail = spec.rpartition(":")
-        # Same rule as load_graph: a trailing ':token' with no path separator is
-        # a graph name, not part of a Windows drive path.
-        if tail and "/" not in tail and "\\" not in tail:
-            path_part, suffix = head, f":{tail}"
-    # Only a .py file path is workspace-relative; a module path is not a file.
-    if path_part.endswith(".py"):
-        return f"{Path(path_part).expanduser().resolve()}{suffix}"
-    return spec
+    path_part, suffix = parsed
+    return f"{Path(path_part).expanduser().resolve()}{suffix}"
+
+
+def _rebase_toml_file_spec(spec: str, toml_dir: Path) -> str:
+    """Resolve a relative *file-path* agent spec that came from a ``langstage.toml``
+    against that toml's OWN directory — the discovered project root — not the cwd.
+
+    Config discovery walks UP to find ``langstage.toml``, but a relative ``agent.spec``
+    in it (what ``init`` scaffolds, e.g. ``"my_agent.py:graph"``) was resolved against
+    the process cwd, so running from a subdir crashed ``Agent file not found`` even
+    though ``--show-config`` reported the spec resolved. A toml-sourced relative spec's
+    natural base is the config file's directory — like a path in ``pyproject.toml`` /
+    ``tsconfig.json`` resolves relative to the config file — so the project runs
+    identically from its root and any subdirectory. (gh #116)
+
+    Only applied to *toml-sourced* specs; specs from ``-a`` / ``LANGSTAGE_AGENT_SPEC``
+    keep #30's cwd-relative base ("where the user typed it"). Module specs
+    (``pkg.mod:attr``) and already-absolute paths pass through unchanged.
+    """
+    parsed = _split_py_file_spec(spec)
+    if parsed is None:
+        return spec
+    path_part, suffix = parsed
+    file_path = Path(path_part).expanduser()
+    if file_path.is_absolute():
+        return spec
+    return f"{(toml_dir / file_path).resolve()}{suffix}"
 
 
 def get_tool_arg_preview(args: Dict[str, Any]) -> str:
@@ -1694,7 +1736,19 @@ async def _run_turn_persistent(
     from langstage_cli.agui_stream import build_session_agent
 
     async with AsyncSqliteSaver.from_conn_string(str(sqlite_path)) as saver:
-        graph.checkpointer = saver
+        # Attach the durable saver, but GUARD the assignment the way _ensure_checkpointer
+        # does. A wrong-type agent object (graph = None / a dict / an int — not a compiled
+        # graph) rejects the attribute set, and on this default persist-on path that used
+        # to leak a cryptic `AttributeError: 'X' object has no attribute 'checkpointer'`
+        # BEFORE any validation ran. Swallowing it lets the object fall through to
+        # build_session_agent -> build_agent, whose validator raises the clean, actionable
+        # `TypeError: build_agent expected a compiled LangGraph graph ...` — the same
+        # message --verify / --no-persist already show. A valid graph accepts the
+        # assignment, so durable persistence is unchanged. (gh #117)
+        try:
+            graph.checkpointer = saver
+        except Exception:  # noqa: BLE001 - defer to build_agent's clean type validation below
+            pass
         agent = build_session_agent(graph, name=name, config=session_config)
         return await run_single_turn_agui(agent, message, thread_id, interactive, verbose)
 
@@ -2449,10 +2503,24 @@ def main(
                 _status(f"\n{DIM}Or set the LANGSTAGE_AGENT_SPEC environment variable{RESET}")
                 sys.exit(1)
 
-        # Resolve a relative file-path spec against the invocation cwd BEFORE we
-        # chdir into the workspace root — otherwise `-a my_agent.py` is looked up
-        # under workspace_root, not where the user is and put the file. (gh #30)
-        final_spec = _absolutize_file_spec(final_spec)
+        # Resolve a relative file-path spec to an absolute path BEFORE we chdir into
+        # the workspace root — otherwise it's looked up under workspace_root, not where
+        # the file is. The BASE directory depends on WHERE the spec came from:
+        #   - a spec from a discovered `langstage.toml` resolves against THAT toml's own
+        #     directory (the project root the walk-up found), like a path in
+        #     pyproject.toml / tsconfig — so the project runs identically from its root
+        #     and any subdirectory (gh #116);
+        #   - a spec from `-a` / `LANGSTAGE_AGENT_SPEC` (or the built-in default) stays
+        #     cwd-relative — "the file is where the user typed the command" (gh #30).
+        spec_toml_dir = (
+            config_module.toml_dir_for(cfg, "agent_spec")
+            if cfg.sources.get("agent_spec", "").startswith("toml")
+            else None
+        )
+        if spec_toml_dir is not None:
+            final_spec = _rebase_toml_file_spec(final_spec, spec_toml_dir)
+        else:
+            final_spec = _absolutize_file_spec(final_spec)
 
         # Apply the resolved workspace as the single source of truth (ADR 0005):
         # publish it (env + active) so the agent's tools can read workspace_root(),
